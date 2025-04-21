@@ -71,9 +71,16 @@ io.on('connection', (socket) => {
 // Start server
 const PORT = process.env.WEB_PORT || 3000;
 function startWebServer() {
-    server.listen(PORT, () => {
-        console.log(`Log viewer server running on http://localhost:${PORT}`);
-    });
+    // Only start the web server if we're not in a serverless environment
+    if (!process.env.VERCEL) {
+        server.listen(PORT, () => {
+            console.log(`Log viewer server running on http://localhost:${PORT}`);
+        });
+        return true;
+    } else {
+        console.log('Running in serverless mode - log viewer disabled');
+        return false;
+    }
 }
 
 module.exports = { startWebServer }; 

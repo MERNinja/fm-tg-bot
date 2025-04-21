@@ -11,11 +11,14 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 - Real-time log viewer dashboard for monitoring bot activity
 - Clean MVC architecture for maintainability
 - Fully integrated with the Fullmetal agent data model
+- Serverless deployment support with Vercel
 
 ## Project Structure
 
 ```
 ├── src
+│   ├── api
+│   │   └── webhook.js      # Serverless function for Telegram webhook
 │   ├── config
 │   │   └── database.js     # Database configuration
 │   ├── controllers
@@ -32,6 +35,7 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 ├── .env                    # Environment variables (not in repo)
 ├── .env.example            # Example environment variables
 ├── package.json            # Project metadata and dependencies
+├── vercel.json             # Vercel deployment configuration
 └── README.md               # This file
 ```
 
@@ -54,7 +58,7 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
    # Edit the .env file with your values
    ```
 
-4. Start the bot:
+4. Start the bot locally:
    ```
    npm start
    ```
@@ -64,6 +68,39 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
    npm run dev
    ```
 
+## Deployment
+
+### Vercel Deployment
+
+This bot can be deployed to Vercel as a serverless application:
+
+1. Install the Vercel CLI:
+   ```
+   npm install -g vercel
+   ```
+
+2. Login to Vercel:
+   ```
+   vercel login
+   ```
+
+3. Deploy to Vercel:
+   ```
+   vercel
+   ```
+
+4. Set up environment variables on Vercel:
+   - Go to your Vercel dashboard
+   - Navigate to your project
+   - Go to Settings > Environment Variables
+   - Add all the required variables from your `.env` file
+   - Make sure to set `VERCEL=true`
+   - Set `WEBHOOK_URL` to your Vercel deployment URL (e.g., https://your-app.vercel.app)
+
+5. Configure your Telegram bot to use webhooks:
+   - After deployment, Vercel will provide you with a URL
+   - Your webhook will be available at `https://your-app.vercel.app/api/webhook`
+
 ## Usage
 
 - Start a conversation with your bot on Telegram (`/start`)
@@ -71,7 +108,7 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 - Use `/chat <message>` to send a specific prompt
 - Use `/setprompt <agentId> <pre-prompt>` to configure a pre-prompt for an agent
 - Use `/agentinfo <agentId>` to get information about an agent
-- Access the real-time log viewer at `http://localhost:3000` (or your configured port)
+- Access the real-time log viewer at `http://localhost:3000` (or your configured port) when running locally
 
 ## Bot Commands
 
@@ -84,7 +121,7 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 
 ## Log Viewer
 
-The bot includes a real-time log viewer accessible via a web browser:
+The bot includes a real-time log viewer accessible via a web browser when running locally:
 
 - View logs in real-time as they happen
 - Filter logs by level (info, error, warning, debug)
@@ -125,6 +162,8 @@ The bot uses an expanded version of the Fullmetal agent model, including:
 - `FULLMETAL_AGENT_ID`: Default Fullmetal agent ID to use
 - `MONGODB_URI`: MongoDB connection string
 - `WEB_PORT`: Port for the log viewer web server (default: 3000)
+- `VERCEL`: Set to 'true' when deploying to Vercel
+- `WEBHOOK_URL`: URL for the Telegram webhook (for Vercel deployment)
 
 ## License
 
