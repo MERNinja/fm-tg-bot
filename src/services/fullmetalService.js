@@ -39,17 +39,17 @@ class FullmetalService {
    * @param {string} agentId - The agent ID to use
    * @returns {Promise<Object>} - Object containing the full prompt and agent ID
    */
-  async preparePrompt(userMessage, agentId) {
+  async preparePrompt(userMessage, agent) {
     // Default to environment variable if not provided
-    const targetAgentId = agentId;
+    const targetAgentId = agent._id;
     let prePrompt = '';
     let role = '';
     let summary = {};
 
     // Try to fetch agent details from database
-    const agent = await this.getAgentDetails(targetAgentId);
+    // const agent = await this.getAgentDetails(targetAgentId);
     if (agent) {
-      prePrompt = agent.summary.system || '';
+      prePrompt = agent.summary.systemPrompt || '';
       role = agent.role || '';
       summary = agent.summary || {};
       
@@ -116,15 +116,15 @@ class FullmetalService {
    * @param {string} agentId - The agent ID to use
    * @returns {Promise<{response: Response, agent: Object}>} - The streaming response from the API and agent object
    */
-  async getStreamingResponse(userMessage, agentId, fullmetalApiKey) {
-    const { fullPrompt, agentId: targetAgentId, agent } = await this.preparePrompt(userMessage, agentId);
+  async getStreamingResponse(userMessage, agent) {
+    const { fullPrompt, agentId: targetAgentId } = await this.preparePrompt(userMessage, agent);
     
     console.log(`Processing message: ${fullPrompt}`);
     const response = await fetch(this.API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'apikey': fullmetalApiKey
+        'apikey': agent.userId.apiKey[0]
       },
       body: JSON.stringify({
         prompt: fullPrompt,

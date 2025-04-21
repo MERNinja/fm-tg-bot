@@ -10,11 +10,11 @@ class MessageController {
    * @param {Object} ctx - The Telegram context object
    * @returns {Promise<string>} - The final response text
    */
-  async processMessage(userMessage, ctx, fullmetalApiKey, fullmetalAgentId) {
+  async processMessage(userMessage, ctx, agent) {
     
     try {
       // Get streaming response from Fullmetal API
-      const { response, agent } = await fullmetalService.getStreamingResponse(userMessage, fullmetalAgentId, fullmetalApiKey);
+      const { response } = await fullmetalService.getStreamingResponse(userMessage, agent);
       
       // Create initial message to update
       const sentMessage = await ctx.reply('...');
