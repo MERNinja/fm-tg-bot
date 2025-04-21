@@ -8,6 +8,7 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 - Real-time streaming of AI responses with typing indicators ("...")
 - Store and use agent-specific pre-prompts and context information from MongoDB
 - Track and display agent performance metrics (average response time, prompts served)
+- Real-time log viewer dashboard for monitoring bot activity
 - Clean MVC architecture for maintainability
 - Fully integrated with the Fullmetal agent data model
 
@@ -23,6 +24,10 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 │   │   └── Agent.js        # Mongoose model for agents
 │   ├── services
 │   │   └── fullmetalService.js  # Service for API interactions
+│   │   └── loggerService.js     # Logging service with in-memory storage
+│   ├── web
+│   │   ├── server.js       # Express server for log viewer
+│   │   └── public/         # Static files for the log viewer UI
 │   └── index.js            # Main entry point
 ├── .env                    # Environment variables (not in repo)
 ├── .env.example            # Example environment variables
@@ -66,6 +71,7 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 - Use `/chat <message>` to send a specific prompt
 - Use `/setprompt <agentId> <pre-prompt>` to configure a pre-prompt for an agent
 - Use `/agentinfo <agentId>` to get information about an agent
+- Access the real-time log viewer at `http://localhost:3000` (or your configured port)
 
 ## Bot Commands
 
@@ -75,6 +81,33 @@ A Telegram bot that integrates with Fullmetal AI, using MongoDB to store and ret
 | `/chat <message>` | Send a message to the AI |
 | `/setprompt <agentId> <pre-prompt>` | Set a pre-prompt for an agent |
 | `/agentinfo <agentId>` | Get information about an agent |
+
+## Log Viewer
+
+The bot includes a real-time log viewer accessible via a web browser:
+
+- View logs in real-time as they happen
+- Filter logs by level (info, error, warning, debug)
+- Search logs for specific text
+- Pause and clear logs as needed
+- View detailed metadata for each log entry
+- In-memory storage of up to 1000 most recent logs
+
+### Testing the Log Viewer
+
+You can generate test logs to see the log viewer in action:
+1. Start the bot with `npm run dev`
+2. Access the log viewer at `http://localhost:3000`
+3. Generate test logs by visiting `http://localhost:3000/api/test-logs`
+4. See the logs appear in the log viewer in real-time
+
+### Log Viewer API
+
+The log viewer exposes several REST API endpoints:
+
+- `GET /api/logs` - Retrieve all stored logs
+- `POST /api/logs/clear` - Clear all stored logs
+- `GET /api/test-logs` - Generate test logs of various levels
 
 ## Agent Model
 
@@ -91,6 +124,7 @@ The bot uses an expanded version of the Fullmetal agent model, including:
 - `FULLMETAL_API_KEY`: Your Fullmetal AI API key
 - `FULLMETAL_AGENT_ID`: Default Fullmetal agent ID to use
 - `MONGODB_URI`: MongoDB connection string
+- `WEB_PORT`: Port for the log viewer web server (default: 3000)
 
 ## License
 
