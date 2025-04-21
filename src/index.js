@@ -62,7 +62,6 @@ bot.telegram.setMyCommands([
 // Handle text messages
 bot.on('text', async (ctx) => {
   try {
-    ctx.reply('🧠 Thinking...');
     await messageController.processMessage(ctx.message.text, ctx, fullmetalApiKey, fullmetalAgentId);
   } catch (error) {
     console.error('Error:', error);
