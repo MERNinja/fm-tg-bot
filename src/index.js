@@ -1,6 +1,7 @@
 const { Telegraf } = require('telegraf');
 const { message } = require('telegraf/filters');
 require('dotenv').config();
+const fs = require('fs');
 
 // Import controllers and services
 const messageController = require('./controllers/messageController');
@@ -13,6 +14,32 @@ connectDB();
 
 // Store active bots with their corresponding agent IDs and updatedAt timestamps
 const activeBots = new Map();
+
+// Add heartbeat mechanism
+function setupHeartbeat() {
+  if (process.env.NODE_HEARTBEAT_FILE && process.env.NODE_HEARTBEAT_INTERVAL) {
+    const heartbeatFile = process.env.NODE_HEARTBEAT_FILE;
+    const interval = parseInt(process.env.NODE_HEARTBEAT_INTERVAL) || 30000;
+
+    console.log(`Setting up heartbeat mechanism (interval: ${interval}ms, file: ${heartbeatFile})`);
+
+    // Update heartbeat regularly
+    setInterval(() => {
+      try {
+        fs.writeFileSync(heartbeatFile, Date.now().toString());
+      } catch (error) {
+        console.error(`Error writing heartbeat: ${error.message}`);
+      }
+    }, interval);
+
+    // Also update on certain events
+    process.on('message', () => {
+      try {
+        fs.writeFileSync(heartbeatFile, Date.now().toString());
+      } catch (error) { /* ignore */ }
+    });
+  }
+}
 
 // Async function to fetch agents and user data
 async function initializeAgentData() {
@@ -72,8 +99,17 @@ async function initializeAgentData() {
 
             if (agent._id) {
               try {
-                // Initialize the bot
-                const bot = new Telegraf(agent.summary.telegram.token);
+                // Initialize the bot with extended timeout options
+                const bot = new Telegraf(agent.summary.telegram.token, {
+                  telegram: {
+                    // API timeout in ms (default: 30000ms)
+                    apiTimeout: 180000, // 3 minutes
+                    // Polling parameters for webhook mode
+                    webhookReply: false
+                  },
+                  // Telegram client options
+                  handlerTimeout: 180000 // 3 minutes handler timeout
+                });
                 console.log('Bot initialized:', agent.summary.telegram.token.substring(0, 10) + '...', agent.name);
 
                 // Wait for 1 second before continuing
@@ -212,4 +248,7 @@ function scheduleAgentUpdates(intervalMinutes = 1) {
   // Schedule periodic updates
   scheduleAgentUpdates();
   console.log('Agent update scheduler initialized');
+
+  // Setup heartbeat mechanism
+  setupHeartbeat();
 })();

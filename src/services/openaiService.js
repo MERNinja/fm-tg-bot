@@ -1,10 +1,14 @@
 const { OpenAI } = require('openai');
 require('dotenv').config();
 
+// OpenAI request timeout (30 seconds)
+const OPENAI_TIMEOUT = 30000;
+
 class OpenAIService {
     constructor() {
         this.openai = new OpenAI({
-            apiKey: process.env.OPENAI_API_KEY
+            apiKey: process.env.OPENAI_API_KEY,
+            timeout: OPENAI_TIMEOUT
         });
     }
 
@@ -15,7 +19,10 @@ class OpenAIService {
      */
     async summarizeConversation(messages) {
         try {
+            console.log(`[OpenAI] Starting summarization request for ${messages?.length || 0} messages`);
+
             if (!messages || messages.length === 0) {
+                console.log('[OpenAI] No messages to summarize');
                 return '';
             }
 
@@ -25,8 +32,11 @@ class OpenAIService {
             );
 
             if (validMessages.length === 0) {
+                console.log('[OpenAI] No valid messages after filtering');
                 return '';
             }
+
+            console.log(`[OpenAI] Summarizing ${validMessages.length} messages`);
 
             // Create a formatted conversation string for the AI
             const conversationText = validMessages.map(m => {
@@ -46,8 +56,15 @@ class OpenAIService {
       
       Summary:`;
 
-            // Call OpenAI API for summarization
-            const response = await this.openai.chat.completions.create({
+            // Create a promise with timeout
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => {
+                    reject(new Error(`OpenAI summarization request timed out after ${OPENAI_TIMEOUT / 1000} seconds`));
+                }, OPENAI_TIMEOUT);
+            });
+
+            // Call OpenAI API for summarization with timeout
+            const apiPromise = this.openai.chat.completions.create({
                 model: "gpt-3.5-turbo",
                 messages: [
                     {
@@ -63,11 +80,27 @@ class OpenAIService {
                 temperature: 0.7,
             });
 
+            // Race against timeout
+            const response = await Promise.race([apiPromise, timeoutPromise]);
+
             // Extract and return the summary
             const summary = response.choices[0]?.message?.content?.trim();
+            console.log(`[OpenAI] Summarization successful, result length: ${summary?.length || 0}`);
+
             return summary || 'Conversation summary not available.';
         } catch (error) {
-            console.error('Error using OpenAI for summarization:', error);
+            // Specific error handling
+            if (error.message && error.message.includes('timed out')) {
+                console.error('[OpenAI] Summarization request timed out:', error.message);
+                return 'Conversation summary not available due to timeout.';
+            }
+
+            if (error.status) {
+                console.error(`[OpenAI] API error (${error.status}):`, error.message);
+                return `Conversation summary not available. API error ${error.status}.`;
+            }
+
+            console.error('[OpenAI] Error using OpenAI for summarization:', error);
             return 'Conversation summary not available due to an error.';
         }
     }

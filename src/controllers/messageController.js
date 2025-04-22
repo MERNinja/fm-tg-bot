@@ -1,6 +1,10 @@
 const fullmetalService = require('../services/fullmetalService');
 const memoryService = require('../services/memoryService');
 require('dotenv').config();
+
+// Define a longer timeout for operations (3 minutes)
+const API_TIMEOUT = 180000; // 3 minutes in milliseconds
+
 /**
  * Process streaming responses from Fullmetal AI and update the Telegram message
  */
@@ -10,11 +14,12 @@ class MessageController {
    * @param {string} userMessage - The user's message
    * @param {Object} ctx - The Telegram context object
    * @returns {Promise<string>} - The final response text
-   */3.
-
+   */
   async processMessage(userMessage, ctx, agent) {
     
     try {
+      console.log(`[Controller] Processing message from user: ${ctx.from.id}, text: "${userMessage.substring(0, 50)}${userMessage.length > 50 ? '...' : ''}"`);
+
       const telegramUserId = ctx.from.id.toString();
       const telegramChatId = ctx.chat.id.toString();
       const agentId = agent._id.toString();
@@ -22,105 +27,176 @@ class MessageController {
       // Store user message in conversation history
       await memoryService.addMessage(telegramUserId, telegramChatId, agentId, 'user', userMessage);
 
-      // Get conversation history to provide context
-      const conversationContext = await memoryService.buildContextFromHistory(telegramUserId, telegramChatId, agentId);
-
-      // If we have conversation context, add it to the message
-      const messageWithContext = conversationContext
-        ? `${conversationContext}\n\nUser's current message: ${userMessage}`
-        : userMessage;
-
-      // Get streaming response from Fullmetal API
-      const { response } = await fullmetalService.getStreamingResponse(messageWithContext, agent);
-      
-      // Create initial message to update
-      const sentMessage = await ctx.reply('...');
+      // Create initial message to update (early response)
+      const sentMessage = await ctx.reply('Processing your message...');
       let messageId = sentMessage.message_id;
-      let responseText = '';
-      let buffer = '';
-      
-      // Store response start time for metrics
-      const responseStartTime = Date.now();
 
-      return new Promise((resolve, reject) => {
-        // Process the stream
-        response.body.on('data', chunk => {
-          buffer += chunk.toString();
-          
-          if (buffer.includes('\n\n')) {
-            const parts = buffer.split('\n\n');
-            buffer = parts.pop(); // Keep the last incomplete part
-            
-            for (const part of parts) {
-              if (part.startsWith('data:')) {
-                const jsonData = part.substring(5).trim();
-                if (jsonData === '[DONE]') continue;
-                
+      try {
+        // Get conversation history to provide context
+        console.log(`[Controller] Building context from history for user: ${telegramUserId}`);
+        const conversationContext = await memoryService.buildContextFromHistory(telegramUserId, telegramChatId, agentId);
+
+        // If we have conversation context, add it to the message
+        const messageWithContext = conversationContext
+          ? `${conversationContext}\n\nUser's current message: ${userMessage}`
+          : userMessage;
+
+        console.log(`[Controller] Sending request to Fullmetal API, context length: ${messageWithContext.length}`);
+
+        // Update message to show we're waiting for API
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          messageId,
+          undefined,
+          'Thinking...'
+        ).catch(error => console.error('[Controller] Error updating initial message:', error));
+
+        // Get streaming response from Fullmetal API with timeout handling
+        const apiPromise = fullmetalService.getStreamingResponse(messageWithContext, agent);
+
+        // Create a timeout promise
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`API request timed out after ${API_TIMEOUT / 1000} seconds`));
+          }, API_TIMEOUT);
+        });
+
+        // Race the API promise against the timeout
+        const { response } = await Promise.race([apiPromise, timeoutPromise]);
+
+        let responseText = '';
+        let buffer = '';
+
+        // Store response start time for metrics
+        const responseStartTime = Date.now();
+
+        return new Promise((resolve, reject) => {
+          // Process the stream
+          response.body.on('data', chunk => {
+            buffer += chunk.toString();
+
+            if (buffer.includes('\n\n')) {
+              const parts = buffer.split('\n\n');
+              buffer = parts.pop(); // Keep the last incomplete part
+
+              for (const part of parts) {
+                if (part.startsWith('data:')) {
+                  const jsonData = part.substring(5).trim();
+                  if (jsonData === '[DONE]') continue;
+
+                  try {
+                    const data = JSON.parse(jsonData);
+                    if (data.token && !data.completed) {
+                      responseText += data.token;
+                      // Update the message periodically (not on every token to avoid rate limits)
+                      if (responseText.length % 20 === 0) {
+                        ctx.telegram.editMessageText(
+                          ctx.chat.id,
+                          messageId,
+                          undefined,
+                          responseText + "..."
+                        ).catch(error => console.error('[Controller] Error updating message:', error));
+                      }
+                    }
+                  } catch (e) {
+                    console.error('[Controller] Error parsing chunk:', e);
+                  }
+                }
+              }
+            }
+          });
+
+          response.body.on('end', async () => {
+            // Process any remaining data in buffer
+            if (buffer.startsWith('data:')) {
+              const jsonData = buffer.substring(5).trim();
+              if (jsonData !== '[DONE]') {
                 try {
                   const data = JSON.parse(jsonData);
                   if (data.token && !data.completed) {
                     responseText += data.token;
-                    // Update the message periodically (not on every token to avoid rate limits)
-                    if (responseText.length % 20 === 0) {
-                      ctx.telegram.editMessageText(
-                        ctx.chat.id, 
-                        messageId, 
-                        undefined, 
-                        responseText + "..."
-                      ).catch(error => console.error('Error updating message:', error));
-                    }
                   }
                 } catch (e) {
-                  console.error('Error parsing chunk:', e);
+                  console.error('[Controller] Error parsing final chunk:', e);
                 }
               }
             }
-          }
-        });
 
-        response.body.on('end', async () => {
-          // Process any remaining data in buffer
-          if (buffer.startsWith('data:')) {
-            const jsonData = buffer.substring(5).trim();
-            if (jsonData !== '[DONE]') {
+            // Final update to the message
+            try {
+              await ctx.telegram.editMessageText(
+                ctx.chat.id,
+                messageId,
+                undefined, 
+                responseText || '⚠️ Empty response.'
+              );
+            } catch (error) {
+              console.error('[Controller] Error updating final message:', error);
+              // If editing fails, try sending a new message
               try {
-                const data = JSON.parse(jsonData);
-                if (data.token && !data.completed) {
-                  responseText += data.token;
-                }
-              } catch (e) {
-                console.error('Error parsing final chunk:', e);
+                await ctx.reply('⚠️ Error updating message. Full response:');
+                await ctx.reply(responseText || '⚠️ Empty response.');
+              } catch (secondError) {
+                console.error('[Controller] Error sending fallback message:', secondError);
               }
             }
-          }
-          
-          // Final update to the message
-          ctx.telegram.editMessageText(
-            ctx.chat.id, 
-            messageId, 
-            undefined, 
-            responseText || `⚠️ I apologize, but I couldn't generate a reply at this time. Please try again later.`
-          ).catch(error => console.error('Error updating final message:', error));
-          
-          // Store assistant response in conversation history
-          await memoryService.addMessage(telegramUserId, telegramChatId, agentId, 'assistant', responseText);
 
-          // Update agent metrics if we have an agent
-          if (agent && agent._id) {
-            await fullmetalService.updateResponseMetrics(agent, responseStartTime);
-          }
-          
-          resolve(responseText || `⚠️ I apologize, but I couldn't reply at this moment. Please try again later.`);
-        });
+            // Store assistant response in conversation history
+            if (responseText) {
+              await memoryService.addMessage(telegramUserId, telegramChatId, agentId, 'assistant', responseText);
+            }
 
-        response.body.on('error', err => {
-          console.error('Stream error:', err);
-          reject(err);
+            // Update agent metrics if we have an agent
+            if (agent && agent._id) {
+              await fullmetalService.updateResponseMetrics(agent, responseStartTime);
+            }
+
+            console.log(`[Controller] Completed processing message from user: ${telegramUserId}, response length: ${responseText.length}`);
+            resolve(responseText || '⚠️ Empty response.');
+          });
+
+          response.body.on('error', err => {
+            console.error('[Controller] Stream error:', err);
+            reject(err);
+          });
         });
-      });
+      } catch (innerError) {
+        console.error('[Controller] Error during message processing:', innerError);
+
+        // If it's a timeout or API error, send a friendly message
+        let errorMessage = '⚠️ Sorry, I\'m having trouble processing your request right now.';
+
+        if (innerError.message && innerError.message.includes('timed out')) {
+          errorMessage = '⚠️ Sorry, the response is taking too long. Please try again with a simpler query or try later.';
+        } else if (innerError.message && innerError.message.includes('API error')) {
+          errorMessage = '⚠️ Sorry, there was an error communicating with the AI service. Please try again later.';
+        }
+
+        // Update the initial message with the error
+        try {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            messageId,
+            undefined,
+            errorMessage
+          );
+        } catch (msgError) {
+          // If editing fails, send a new message
+          console.error('[Controller] Error updating error message:', msgError);
+          await ctx.reply(errorMessage).catch(e => console.error('[Controller] Failed to send error message:', e));
+        }
+
+        return errorMessage;
+      }
     } catch (error) {
-      console.error('Error processing message:', error);
-      // throw error;
+      console.error('[Controller] Unhandled error in processMessage:', error);
+      // Try to send an error message to the user
+      try {
+        await ctx.reply('⚠️ An unexpected error occurred while processing your request. Please try again later.');
+      } catch (replyError) {
+        console.error('[Controller] Failed to send error message:', replyError);
+      }
+      throw error;
     }
   }
 
