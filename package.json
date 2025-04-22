@@ -4,7 +4,8 @@
   "description": "Telegram bot integrating with Fullmetal AI using MongoDB for pre-prompts",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node start.js",
+    "start:direct": "node src/index.js",
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
@@ -12,6 +13,7 @@
     "express": "^5.1.0",
     "mongoose": "^7.8.6",
     "node-fetch": "^3.2.0",
+    "openai": "^4.24.2",
     "socket.io": "^4.8.1",
     "telegraf": "^4.10.0",
     "winston": "^3.17.0"

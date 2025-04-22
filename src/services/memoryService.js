@@ -1,4 +1,5 @@
 const Conversation = require('../models/Conversation');
+const openaiService = require('./openaiService');
 
 class MemoryService {
     /**
@@ -10,6 +11,8 @@ class MemoryService {
      */
     async getOrCreateConversation(telegramUserId, telegramChatId, agentId) {
         try {
+            console.log(`[Memory] Looking for conversation: User=${telegramUserId}, Chat=${telegramChatId}, Agent=${agentId}`);
+
             let conversation = await Conversation.findOne({
                 telegramUserId,
                 telegramChatId,
@@ -17,6 +20,7 @@ class MemoryService {
             });
 
             if (!conversation) {
+                console.log(`[Memory] Conversation not found, creating new conversation`);
                 conversation = new Conversation({
                     telegramUserId,
                     telegramChatId,
@@ -24,12 +28,14 @@ class MemoryService {
                     messages: []
                 });
                 await conversation.save();
-                console.log(`Created new conversation for user ${telegramUserId} with agent ${agentId}`);
+                console.log(`[Memory] Created new conversation for user ${telegramUserId} with agent ${agentId}, ID: ${conversation._id}`);
+            } else {
+                console.log(`[Memory] Found existing conversation: ID=${conversation._id}, Messages=${conversation.messages.length}`);
             }
 
             return conversation;
         } catch (error) {
-            console.error('Error getting or creating conversation:', error);
+            console.error(`[Memory] ERROR in getOrCreateConversation: ${error.message}`, error);
             // throw error;
         }
     }
@@ -45,14 +51,21 @@ class MemoryService {
      */
     async addMessage(telegramUserId, telegramChatId, agentId, role, content) {
         try {
+            console.log(`[Memory] Adding message: User=${telegramUserId}, Role=${role}, ContentLength=${content?.length || 0}`);
+
             // Validate content - don't store empty messages
             if (!content || content.trim() === '') {
-                console.log(`Skipping empty message from ${role} for user ${telegramUserId}`);
+                console.log(`[Memory] Skipping empty message from ${role} for user ${telegramUserId}`);
                 return null;
             }
 
             const conversation = await this.getOrCreateConversation(telegramUserId, telegramChatId, agentId);
+            if (!conversation) {
+                console.log('[Memory] Failed to get or create conversation, message not saved');
+                return null;
+            }
 
+            // Add message to conversation
             conversation.messages.push({
                 role,
                 content: content.trim(), // Ensure content is trimmed
@@ -60,16 +73,19 @@ class MemoryService {
             });
 
             conversation.lastActive = new Date();
+            console.log(`[Memory] Saving conversation with ${conversation.messages.length} messages`);
             await conversation.save();
+            console.log(`[Memory] Message saved successfully to conversation ${conversation._id}`);
 
             // If message count exceeds threshold, summarize older messages
             if (conversation.messages.length > 10) {
+                console.log(`[Memory] Message threshold exceeded (${conversation.messages.length} > 10), triggering summarization`);
                 this.summarizeOldMessages(conversation._id);
             }
 
             return conversation;
         } catch (error) {
-            console.error('Error adding message to conversation:', error);
+            console.error(`[Memory] ERROR in addMessage: ${error.message}`, error);
             // throw error;
         }
     }
@@ -84,21 +100,34 @@ class MemoryService {
      */
     async getConversationHistory(telegramUserId, telegramChatId, agentId, limit = 20) {
         try {
+            console.log(`[Memory] Getting conversation history: User=${telegramUserId}, Limit=${limit}`);
+
             const conversation = await this.getOrCreateConversation(telegramUserId, telegramChatId, agentId);
+            if (!conversation) {
+                console.log('[Memory] Failed to get conversation, returning empty history');
+                return [];
+            }
 
             // If there's a summary and many messages, use the summary to provide context
             if (conversation.summary && conversation.messages.length > 30) {
+                console.log(`[Memory] Using summary with recent messages (total: ${conversation.messages.length})`);
                 const recentMessages = conversation.messages.slice(-limit);
-                return [
+
+                const result = [
                     { role: 'system', content: `Previous conversation summary: ${conversation.summary}` },
                     ...recentMessages
                 ];
+
+                console.log(`[Memory] Returning ${result.length} messages with summary`);
+                return result;
             }
 
             // Return the most recent messages up to the limit
-            return conversation.messages.slice(-limit);
+            const messages = conversation.messages.slice(-limit);
+            console.log(`[Memory] Returning ${messages.length} recent messages (no summary)`);
+            return messages;
         } catch (error) {
-            console.error('Error getting conversation history:', error);
+            console.error(`[Memory] ERROR in getConversationHistory: ${error.message}`, error);
             return [];
         }
     }
@@ -110,72 +139,121 @@ class MemoryService {
      */
     async summarizeOldMessages(conversationId) {
         try {
+            console.log(`[Memory] Starting summarization for conversation: ${conversationId}`);
+
             const conversation = await Conversation.findById(conversationId);
-            if (!conversation) return;
+            if (!conversation) {
+                console.log(`[Memory] Conversation ${conversationId} not found, aborting summarization`);
+                return;
+            }
 
             // Keep only the most recent 5 messages and summarize the rest
             const messagesToKeep = 5;
-            if (conversation.messages.length <= messagesToKeep) return;
+            if (conversation.messages.length <= messagesToKeep) {
+                console.log(`[Memory] Not enough messages to summarize (${conversation.messages.length} <= ${messagesToKeep})`);
+                return;
+            }
 
             const oldMessages = conversation.messages.slice(0, -messagesToKeep);
+            console.log(`[Memory] Found ${oldMessages.length} old messages to summarize`);
 
             // Filter out any potentially empty messages
             const validOldMessages = oldMessages.filter(m =>
                 m.content && m.content.trim() !== ''
             );
+            console.log(`[Memory] ${validOldMessages.length} valid messages for summarization after filtering`);
 
             if (validOldMessages.length === 0) {
                 // If no valid old messages, just remove empty messages
+                console.log(`[Memory] No valid old messages, just cleaning up conversation`);
                 conversation.messages = conversation.messages.slice(-messagesToKeep);
                 await conversation.save();
+                console.log(`[Memory] Cleaned up conversation, now has ${conversation.messages.length} messages`);
                 return;
             }
 
-            // Create a simple summary - in a production app, you might use an LLM for this
-            let summary = conversation.summary || '';
-            if (summary) summary += '\n\n';
-
-            summary += `${validOldMessages.length} earlier messages exchanged. Key points: `;
-
-            // Extract a simple summary from the messages - handle potential errors
+            // Use OpenAI to generate a summary
+            let aiSummary = '';
             try {
-                const userMessages = validOldMessages.filter(m => m.role === 'user');
-                const assistantMessages = validOldMessages.filter(m => m.role === 'assistant');
-
-                // Add user messages summary if available
-                if (userMessages.length > 0) {
-                    const userContentSamples = userMessages.slice(-3)
-                        .map(m => m.content && typeof m.content === 'string' ? m.content.substring(0, 50) : '')
-                        .filter(text => text.length > 0);
-
-                    if (userContentSamples.length > 0) {
-                        summary += `User discussed: ${userContentSamples.join('; ')}... `;
-                    }
-                }
-
-                // Add assistant messages summary if available
-                if (assistantMessages.length > 0) {
-                    const assistantContentSamples = assistantMessages.slice(-3)
-                        .map(m => m.content && typeof m.content === 'string' ? m.content.substring(0, 50) : '')
-                        .filter(text => text.length > 0);
-
-                    if (assistantContentSamples.length > 0) {
-                        summary += `Assistant provided: ${assistantContentSamples.join('; ')}...`;
-                    }
-                }
-            } catch (summaryError) {
-                console.error('Error creating content summary:', summaryError);
-                summary += 'Conversation details not available.';
+                console.log(`[Memory] Calling OpenAI to summarize ${validOldMessages.length} messages`);
+                aiSummary = await openaiService.summarizeConversation(validOldMessages);
+                console.log(`[Memory] AI summarization successful, result length: ${aiSummary.length}`);
+            } catch (aiError) {
+                console.error(`[Memory] Error generating AI summary: ${aiError.message}`, aiError);
+                // Fallback to simple summary method
+                console.log(`[Memory] Falling back to simple summarization`);
+                aiSummary = this.createSimpleSummary(validOldMessages);
+                console.log(`[Memory] Simple summary created, length: ${aiSummary.length}`);
             }
+
+            // Create the final summary
+            let summary = conversation.summary || '';
+            if (summary) {
+                console.log(`[Memory] Appending to existing summary (${summary.length} chars)`);
+                summary += '\n\n';
+            }
+
+            // Add message count and AI summary
+            summary += `${validOldMessages.length} earlier messages summarized: ${aiSummary}`;
+            console.log(`[Memory] Final summary length: ${summary.length} chars`);
 
             // Update conversation with summary and keep only recent messages
             conversation.summary = summary;
             conversation.messages = conversation.messages.slice(-messagesToKeep);
 
+            console.log(`[Memory] Saving updated conversation with summary and ${conversation.messages.length} messages`);
             await conversation.save();
-            console.log(`Summarized old messages for conversation ${conversationId}`);
+            console.log(`[Memory] Summarization complete for conversation ${conversationId}`);
         } catch (error) {
-            console.error('Error summarizing old messages:', error);
+            console.error(`[Memory] ERROR in summarizeOldMessages: ${error.message}`, error);
+        }
+    }
+
+    /**
+     * Create a simple summary as a fallback when AI summarization fails
+     * @param {Array} messages - Array of message objects
+     * @returns {string} - Simple summary text
+     */
+    createSimpleSummary(messages) {
+        try {
+            console.log(`[Memory] Creating simple summary for ${messages.length} messages`);
+
+            const userMessages = messages.filter(m => m.role === 'user');
+            const assistantMessages = messages.filter(m => m.role === 'assistant');
+
+            console.log(`[Memory] Found ${userMessages.length} user messages and ${assistantMessages.length} assistant messages`);
+
+            let summary = '';
+
+            // Add user messages summary if available
+            if (userMessages.length > 0) {
+                const userContentSamples = userMessages.slice(-3)
+                    .map(m => m.content && typeof m.content === 'string' ? m.content.substring(0, 50) : '')
+                    .filter(text => text.length > 0);
+
+                if (userContentSamples.length > 0) {
+                    summary += `User discussed: ${userContentSamples.join('; ')}... `;
+                    console.log(`[Memory] Added ${userContentSamples.length} user samples to summary`);
+                }
+            }
+
+            // Add assistant messages summary if available
+            if (assistantMessages.length > 0) {
+                const assistantContentSamples = assistantMessages.slice(-3)
+                    .map(m => m.content && typeof m.content === 'string' ? m.content.substring(0, 50) : '')
+                    .filter(text => text.length > 0);
+
+                if (assistantContentSamples.length > 0) {
+                    summary += `Assistant provided: ${assistantContentSamples.join('; ')}...`;
+                    console.log(`[Memory] Added ${assistantContentSamples.length} assistant samples to summary`);
+                }
+            }
+
+            console.log(`[Memory] Simple summary created, length: ${summary.length}`);
+            return summary || 'Conversation details not available.';
+        } catch (error) {
+            console.error(`[Memory] ERROR in createSimpleSummary: ${error.message}`, error);
+            return 'Conversation details not available.';
         }
     }
 
@@ -188,15 +266,23 @@ class MemoryService {
      */
     async clearConversationHistory(telegramUserId, telegramChatId, agentId) {
         try {
+            console.log(`[Memory] Clearing conversation history: User=${telegramUserId}, Agent=${agentId}`);
+
             const result = await Conversation.findOneAndUpdate(
                 { telegramUserId, telegramChatId, agentId },
                 { $set: { messages: [], summary: '' } },
                 { new: true }
             );
 
-            return !!result;
+            if (result) {
+                console.log(`[Memory] Successfully cleared conversation history for ID: ${result._id}`);
+                return true;
+            } else {
+                console.log(`[Memory] No conversation found to clear for user ${telegramUserId} with agent ${agentId}`);
+                return false;
+            }
         } catch (error) {
-            console.error('Error clearing conversation history:', error);
+            console.error(`[Memory] ERROR in clearConversationHistory: ${error.message}`, error);
             return false;
         }
     }
@@ -211,22 +297,34 @@ class MemoryService {
      */
     async buildContextFromHistory(telegramUserId, telegramChatId, agentId, maxTokens = 2000) {
         try {
+            console.log(`[Memory] Building context from history: User=${telegramUserId}, maxTokens=${maxTokens}`);
+
             const messages = await this.getConversationHistory(telegramUserId, telegramChatId, agentId);
 
-            if (!messages || messages.length === 0) return '';
+            if (!messages || messages.length === 0) {
+                console.log(`[Memory] No messages found, returning empty context`);
+                return '';
+            }
 
             // Filter out any potentially empty messages
             const validMessages = messages.filter(m =>
                 m && m.role && m.content && m.content.trim() !== ''
             );
 
-            if (validMessages.length === 0) return '';
+            console.log(`[Memory] Found ${validMessages.length} valid messages after filtering`);
+
+            if (validMessages.length === 0) {
+                console.log(`[Memory] No valid messages after filtering, returning empty context`);
+                return '';
+            }
 
             // Simple token estimation (1 token ≈ 4 characters)
             const estimatedTokenLimit = maxTokens * 4;
+            console.log(`[Memory] Estimated token limit: ${maxTokens} tokens ≈ ${estimatedTokenLimit} chars`);
 
             let context = 'Previous conversation:\n\n';
             let totalLength = context.length;
+            let includedMessages = 0;
 
             // Add messages to context, respecting token limit
             for (let i = 0; i < validMessages.length; i++) {
@@ -239,22 +337,25 @@ class MemoryService {
                     const messageText = `${roleLabel}: ${message.content}\n\n`;
 
                     if (totalLength + messageText.length > estimatedTokenLimit) {
+                        console.log(`[Memory] Token limit reached after ${includedMessages} messages, truncating`);
                         context += '... (earlier conversation omitted) ...\n\n';
                         break;
                     }
 
                     context += messageText;
                     totalLength += messageText.length;
+                    includedMessages++;
                 } catch (messageError) {
-                    console.error('Error processing message for context:', messageError);
+                    console.error(`[Memory] Error processing message for context: ${messageError.message}`, messageError);
                     // Skip problematic messages
                     continue;
                 }
             }
 
+            console.log(`[Memory] Built context with ${includedMessages}/${validMessages.length} messages, total length: ${totalLength} chars`);
             return context;
         } catch (error) {
-            console.error('Error building context from history:', error);
+            console.error(`[Memory] ERROR in buildContextFromHistory: ${error.message}`, error);
             return '';
         }
     }
