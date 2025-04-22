@@ -78,8 +78,8 @@ class MemoryService {
             console.log(`[Memory] Message saved successfully to conversation ${conversation._id}`);
 
             // If message count exceeds threshold, summarize older messages
-            if (conversation.messages.length > 10) {
-                console.log(`[Memory] Message threshold exceeded (${conversation.messages.length} > 10), triggering summarization`);
+            if (conversation.messages.length > 50) {
+                console.log(`[Memory] Message threshold exceeded (${conversation.messages.length} > 50), triggering summarization`);
                 this.summarizeOldMessages(conversation._id);
             }
 
@@ -148,7 +148,7 @@ class MemoryService {
             }
 
             // Keep only the most recent 5 messages and summarize the rest
-            const messagesToKeep = 5;
+            const messagesToKeep = 30;
             if (conversation.messages.length <= messagesToKeep) {
                 console.log(`[Memory] Not enough messages to summarize (${conversation.messages.length} <= ${messagesToKeep})`);
                 return;
