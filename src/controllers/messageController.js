@@ -48,7 +48,7 @@ class MessageController {
           ctx.chat.id,
           messageId,
           undefined,
-          'Thinking...'
+          'Typing...'
         ).catch(error => console.error('[Controller] Error updating initial message:', error));
 
         // Get streaming response from Fullmetal API with timeout handling
