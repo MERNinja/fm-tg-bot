@@ -49,7 +49,7 @@ class FullmetalService {
     // Try to fetch agent details from database
     // const agent = await this.getAgentDetails(targetAgentId);
     if (agent) {
-      prePrompt = agent.summary.systemPrompt || '';
+      prePrompt = agent.summary.system || '';
       role = agent.role || '';
       summary = agent.summary || {};
       
@@ -117,24 +117,27 @@ class FullmetalService {
    * @returns {Promise<{response: Response, agent: Object}>} - The streaming response from the API and agent object
    */
   async getStreamingResponse(userMessage, agent) {
-    const { fullPrompt, agentId: targetAgentId } = await this.preparePrompt(userMessage, agent);
-    
-    console.log(`Processing message: ${fullPrompt}`);
+    // const { fullPrompt, agentId: targetAgentId } = await this.preparePrompt(userMessage, agent);
+    const bodyData = {
+      prompt: userMessage,
+      agentId: agent._id,
+      stream: true,
+      systemPrompt: agent.summary.system ?
+        `${agent.summary.system}\n\nPlease consider the User's current message for your response.` :
+        "Please consider the User's current message for your response."
+    }
+    console.log(`Processing message: `, bodyData);
     const response = await fetch(this.API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'apikey': agent.userId.apiKey[0]
       },
-      body: JSON.stringify({
-        prompt: fullPrompt,
-        agentId: targetAgentId,
-        stream: true
-      })
+      body: JSON.stringify(bodyData)
     });
 
     if (!response.ok) {
-      throw new Error(`API error: ${response.status}`);
+      // throw new Error(`API error: ${response.status}`);
     }
 
     // Return both the response and the agent for tracking purposes
@@ -173,7 +176,30 @@ class FullmetalService {
       return agent;
     } catch (error) {
       console.error('Error setting pre-prompt:', error);
-      throw error;
+      // throw error;
+    }
+  }
+
+  /**
+   * Get the default agent from the database
+   * @returns {Promise<Object>} - The default agent details
+   */
+  async getDefaultAgent() {
+    try {
+      // Find the first available agent with a Telegram token
+      const agent = await Agent.findOne({
+        'summary.telegram.token': { $exists: true, $ne: null },
+        isAvailable: true
+      });
+
+      if (agent) {
+        console.log(`Using default agent: ${agent.name}`);
+        return agent;
+      }
+      return null;
+    } catch (error) {
+      console.error('Error fetching default agent:', error);
+      return null;
     }
   }
 }

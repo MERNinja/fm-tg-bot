@@ -1,4 +1,5 @@
 const fullmetalService = require('../services/fullmetalService');
+const memoryService = require('../services/memoryService');
 require('dotenv').config();
 /**
  * Process streaming responses from Fullmetal AI and update the Telegram message
@@ -9,12 +10,28 @@ class MessageController {
    * @param {string} userMessage - The user's message
    * @param {Object} ctx - The Telegram context object
    * @returns {Promise<string>} - The final response text
-   */
+   */3.
+
   async processMessage(userMessage, ctx, agent) {
     
     try {
+      const telegramUserId = ctx.from.id.toString();
+      const telegramChatId = ctx.chat.id.toString();
+      const agentId = agent._id.toString();
+
+      // Store user message in conversation history
+      await memoryService.addMessage(telegramUserId, telegramChatId, agentId, 'user', userMessage);
+
+      // Get conversation history to provide context
+      const conversationContext = await memoryService.buildContextFromHistory(telegramUserId, telegramChatId, agentId);
+
+      // If we have conversation context, add it to the message
+      const messageWithContext = conversationContext
+        ? `${conversationContext}\n\nUser's current message: ${userMessage}`
+        : userMessage;
+
       // Get streaming response from Fullmetal API
-      const { response } = await fullmetalService.getStreamingResponse(userMessage, agent);
+      const { response } = await fullmetalService.getStreamingResponse(messageWithContext, agent);
       
       // Create initial message to update
       const sentMessage = await ctx.reply('...');
@@ -82,15 +99,18 @@ class MessageController {
             ctx.chat.id, 
             messageId, 
             undefined, 
-            responseText || '⚠️ Empty response.'
+            responseText || `⚠️ I apologize, but I couldn't generate a reply at this time. Please try again later.`
           ).catch(error => console.error('Error updating final message:', error));
           
+          // Store assistant response in conversation history
+          await memoryService.addMessage(telegramUserId, telegramChatId, agentId, 'assistant', responseText);
+
           // Update agent metrics if we have an agent
           if (agent && agent._id) {
             await fullmetalService.updateResponseMetrics(agent, responseStartTime);
           }
           
-          resolve(responseText || '⚠️ Empty response.');
+          resolve(responseText || `⚠️ I apologize, but I couldn't reply at this moment. Please try again later.`);
         });
 
         response.body.on('error', err => {
@@ -100,7 +120,7 @@ class MessageController {
       });
     } catch (error) {
       console.error('Error processing message:', error);
-      throw error;
+      // throw error;
     }
   }
 
@@ -171,6 +191,101 @@ class MessageController {
     } catch (error) {
       console.error('Error getting agent info:', error);
       ctx.reply('⚠️ An error occurred while retrieving agent information');
+    }
+  }
+
+  /**
+   * Clear conversation history for the current user and agent
+   * @param {Object} ctx - The Telegram context object
+   * @returns {Promise<void>}
+   */
+  async clearMemory(ctx, agent) {
+    try {
+      const telegramUserId = ctx.from.id.toString();
+      const telegramChatId = ctx.chat.id.toString();
+
+      // Extract agent ID if provided, otherwise use default
+      const args = ctx.message.text.split(' ');
+      let agentId = null;
+
+      if (args.length >= 2) {
+        agentId = args[1]; // Use provided agent ID
+      } else {
+        // Try to get agent ID from the current context or use default
+        if (agent) {
+          agentId = agent._id.toString();
+        } else {
+          return ctx.reply('⚠️ Please specify an agent ID: /clearmemory <agentId>');
+        }
+      }
+
+      const success = await memoryService.clearConversationHistory(telegramUserId, telegramChatId, agentId);
+
+      if (success) {
+        ctx.reply('🧹 Conversation history has been cleared. I\'ve forgotten our previous conversation.');
+      } else {
+        ctx.reply('⚠️ Could not clear conversation history. You may not have any stored conversations.');
+      }
+    } catch (error) {
+      console.error('Error clearing memory:', error);
+      ctx.reply('⚠️ An error occurred while clearing conversation history');
+    }
+  }
+
+  /**
+   * Show conversation summary
+   * @param {Object} ctx - The Telegram context object
+   * @returns {Promise<void>}
+   */
+  async showMemory(ctx, agent) {
+    try {
+      const telegramUserId = ctx.from.id.toString();
+      const telegramChatId = ctx.chat.id.toString();
+
+      // Extract agent ID if provided, otherwise use default
+      const args = ctx.message.text.split(' ');
+      let agentId = null;
+
+      if (args.length >= 2) {
+        agentId = args[1]; // Use provided agent ID
+      } else {
+        if (agent) {
+          agentId = agent._id.toString();
+        } else {
+          return ctx.reply('⚠️ Please specify an agent ID: /showmemory <agentId>');
+        }
+      }
+
+      const messages = await memoryService.getConversationHistory(telegramUserId, telegramChatId, agentId);
+
+      if (messages.length === 0) {
+        return ctx.reply('No conversation history found.');
+      }
+
+      // Create a summary of the conversation
+      let summary = `*Conversation History Summary*\n\n`;
+      summary += `You have ${messages.length} messages in this conversation.\n`;
+
+      // Show a few recent messages as a sample
+      if (messages.length > 0) {
+        summary += `\n*Recent messages:*\n`;
+        const recentMessages = messages.slice(-3); // Last 3 messages
+
+        for (const message of recentMessages) {
+          const role = message.role === 'user' ? '👤 You' : '🤖 Assistant';
+          // Truncate message content if it's too long
+          const content = message.content.length > 100
+            ? message.content.substring(0, 100) + '...'
+            : message.content;
+
+          summary += `${role}: ${content}\n\n`;
+        }
+      }
+
+      ctx.reply(summary, { parse_mode: 'Markdown' });
+    } catch (error) {
+      console.error('Error showing memory:', error);
+      ctx.reply('⚠️ An error occurred while retrieving conversation history');
     }
   }
 }

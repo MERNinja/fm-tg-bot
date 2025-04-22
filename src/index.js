@@ -84,7 +84,29 @@ async function initializeAgentData() {
                 // Bot commands
                 bot.start((ctx) => {
                   console.log(`Start command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
-                  ctx.reply('👋 Hi! Talk to me or use /chat to get started.');
+                  const welcomeMessage = `👋 Hi! I'm ${agent.name}. ${agent.summary.description ? `${agent.summary.description}\n\n` : ''} Feel free to start chatting with me!`;
+                  ctx.reply(welcomeMessage);
+                });
+
+                // Add memory-related commands
+                bot.command('clearmemory', async (ctx) => {
+                  console.log(`Clear memory command received from user: ${ctx.from.id}`);
+                  try {
+                    await messageController.clearMemory(ctx, agent);
+                  } catch (error) {
+                    console.error('Error clearing memory:', error);
+                    ctx.reply('⚠️ An error occurred while clearing conversation history.');
+                  }
+                });
+
+                bot.command('showmemory', async (ctx) => {
+                  console.log(`Show memory command received from user: ${ctx.from.id}`);
+                  try {
+                    await messageController.showMemory(ctx, agent);
+                  } catch (error) {
+                    console.error('Error showing memory:', error);
+                    ctx.reply('⚠️ An error occurred while retrieving conversation history.');
+                  }
                 });
 
                 // Handle text messages
@@ -96,6 +118,17 @@ async function initializeAgentData() {
                     console.error('Error processing message:', error);
                     ctx.reply('⚠️ An error occurred while processing your request.');
                   }
+                });
+
+                // Register bot commands with BotFather
+                bot.telegram.setMyCommands([
+                  { command: 'start', description: 'Start the bot' },
+                  { command: 'clearmemory', description: 'Clear your conversation history' },
+                  { command: 'showmemory', description: 'Show a summary of your conversation history' }
+                ]).then(() => {
+                  console.log('Bot commands registered with Telegram');
+                }).catch(error => {
+                  console.error('Failed to register commands:', error);
                 });
 
                 try {
