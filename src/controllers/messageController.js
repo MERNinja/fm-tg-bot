@@ -128,14 +128,14 @@ class MessageController {
                 ctx.chat.id,
                 messageId,
                 undefined, 
-                responseText || '⚠️ Empty response.'
+                responseText || 'Please try again.'
               );
             } catch (error) {
               console.error('[Controller] Error updating final message:', error);
               // If editing fails, try sending a new message
               try {
                 await ctx.reply('⚠️ Error updating message. Full response:');
-                await ctx.reply(responseText || '⚠️ Empty response.');
+                await ctx.reply(responseText || 'Please try again.');
               } catch (secondError) {
                 console.error('[Controller] Error sending fallback message:', secondError);
               }
@@ -152,7 +152,7 @@ class MessageController {
             }
 
             console.log(`[Controller] Completed processing message from user: ${telegramUserId}, response length: ${responseText.length}`);
-            resolve(responseText || '⚠️ Empty response.');
+            resolve(responseText || 'Please try again.');
           });
 
           response.body.on('error', err => {
