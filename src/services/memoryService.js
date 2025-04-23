@@ -1,6 +1,10 @@
 const Conversation = require('../models/Conversation');
 const openaiService = require('./openaiService');
 
+// Cache recent messages to prevent duplicates
+const recentMessageCache = new Map();
+const MESSAGE_CACHE_TTL = 30000; // 30 seconds
+
 class MemoryService {
     /**
      * Get or create a conversation for a specific user and agent
@@ -41,6 +45,35 @@ class MemoryService {
     }
 
     /**
+     * Check if a message appears to be a duplicate of a recently saved message
+     * @param {string} telegramUserId - The Telegram user ID
+     * @param {string} role - The message role
+     * @param {string} content - The message content
+     * @returns {boolean} - True if the message appears to be a duplicate
+     */
+    isDuplicateMessage(telegramUserId, role, content) {
+        const cacheKey = `${telegramUserId}-${role}-${content.substring(0, 50)}`;
+
+        if (recentMessageCache.has(cacheKey)) {
+            console.log(`[Memory] Detected potential duplicate message: ${cacheKey}`);
+            return true;
+        }
+
+        // Store in cache for duplicate detection
+        recentMessageCache.set(cacheKey, Date.now());
+
+        // Cleanup old cache entries (simple TTL implementation)
+        const now = Date.now();
+        for (const [key, timestamp] of recentMessageCache.entries()) {
+            if (now - timestamp > MESSAGE_CACHE_TTL) {
+                recentMessageCache.delete(key);
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Add a message to the conversation history
      * @param {string} telegramUserId - The Telegram user ID
      * @param {string} telegramChatId - The Telegram chat ID
@@ -59,10 +92,25 @@ class MemoryService {
                 return null;
             }
 
+            // Check for potential duplicates
+            if (this.isDuplicateMessage(telegramUserId, role, content)) {
+                console.log(`[Memory] Skipping duplicate message from ${role} for user ${telegramUserId}`);
+                return null;
+            }
+
             const conversation = await this.getOrCreateConversation(telegramUserId, telegramChatId, agentId);
             if (!conversation) {
                 console.log('[Memory] Failed to get or create conversation, message not saved');
                 return null;
+            }
+
+            // Check if the last message is identical to avoid duplicates
+            if (conversation.messages.length > 0) {
+                const lastMessage = conversation.messages[conversation.messages.length - 1];
+                if (lastMessage.role === role && lastMessage.content === content.trim()) {
+                    console.log(`[Memory] Skipping duplicate of last message from ${role} for user ${telegramUserId}`);
+                    return conversation;
+                }
             }
 
             // Add message to conversation
@@ -78,8 +126,8 @@ class MemoryService {
             console.log(`[Memory] Message saved successfully to conversation ${conversation._id}`);
 
             // If message count exceeds threshold, summarize older messages
-            if (conversation.messages.length > 50) {
-                console.log(`[Memory] Message threshold exceeded (${conversation.messages.length} > 50), triggering summarization`);
+            if (conversation.messages.length > 30) {
+                console.log(`[Memory] Message threshold exceeded (${conversation.messages.length} > 10), triggering summarization`);
                 this.summarizeOldMessages(conversation._id);
             }
 
@@ -148,7 +196,7 @@ class MemoryService {
             }
 
             // Keep only the most recent 5 messages and summarize the rest
-            const messagesToKeep = 30;
+            const messagesToKeep = 5;
             if (conversation.messages.length <= messagesToKeep) {
                 console.log(`[Memory] Not enough messages to summarize (${conversation.messages.length} <= ${messagesToKeep})`);
                 return;
@@ -299,9 +347,25 @@ class MemoryService {
         try {
             console.log(`[Memory] Building context from history: User=${telegramUserId}, maxTokens=${maxTokens}`);
 
-            const messages = await this.getConversationHistory(telegramUserId, telegramChatId, agentId);
+            const conversation = await this.getOrCreateConversation(telegramUserId, telegramChatId, agentId);
+            if (!conversation) {
+                console.log(`[Memory] No conversation found, returning empty context`);
+                return '';
+            }
+
+            // Get messages and check if we have a summary
+            const messages = conversation.messages;
+            const hasSummary = conversation.summary && conversation.summary.trim() !== '';
+
+            console.log(`[Memory] Found conversation with ${messages.length} messages${hasSummary ? ' and summary' : ''}`);
 
             if (!messages || messages.length === 0) {
+                // If we have a summary but no messages, still return the summary
+                if (hasSummary) {
+                    console.log(`[Memory] No messages but summary available, returning only summary`);
+                    return `Previous conversation summary: ${conversation.summary}\n\n`;
+                }
+
                 console.log(`[Memory] No messages found, returning empty context`);
                 return '';
             }
@@ -313,8 +377,8 @@ class MemoryService {
 
             console.log(`[Memory] Found ${validMessages.length} valid messages after filtering`);
 
-            if (validMessages.length === 0) {
-                console.log(`[Memory] No valid messages after filtering, returning empty context`);
+            if (validMessages.length === 0 && !hasSummary) {
+                console.log(`[Memory] No valid messages after filtering and no summary, returning empty context`);
                 return '';
             }
 
@@ -324,6 +388,15 @@ class MemoryService {
 
             let context = 'Previous conversation:\n\n';
             let totalLength = context.length;
+
+            // Always include summary if available (it's more important than old messages)
+            if (hasSummary) {
+                const summaryText = `Summary of earlier conversation: ${conversation.summary}\n\n`;
+                context += summaryText;
+                totalLength += summaryText.length;
+                console.log(`[Memory] Added summary to context (${summaryText.length} chars)`);
+            }
+
             let includedMessages = 0;
 
             // Add messages to context, respecting token limit
@@ -338,7 +411,21 @@ class MemoryService {
 
                     if (totalLength + messageText.length > estimatedTokenLimit) {
                         console.log(`[Memory] Token limit reached after ${includedMessages} messages, truncating`);
-                        context += '... (earlier conversation omitted) ...\n\n';
+                        if (includedMessages === 0) {
+                            // If we couldn't add any messages but have a summary, that's still useful
+                            if (hasSummary) {
+                                console.log(`[Memory] No room for messages, but summary was included`);
+                                return context;
+                            }
+
+                            // If we can't even add one message, truncate the message to fit
+                            const truncatedMessage = `${roleLabel}: ${message.content.substring(0, estimatedTokenLimit - totalLength - 50)}...\n\n`;
+                            context += truncatedMessage;
+                            includedMessages++;
+                            console.log(`[Memory] Added truncated message (${truncatedMessage.length} chars)`);
+                        } else {
+                            context += '... (earlier messages omitted for brevity) ...\n\n';
+                        }
                         break;
                     }
 

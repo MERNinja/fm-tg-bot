@@ -24,7 +24,13 @@ class MessageController {
       const telegramChatId = ctx.chat.id.toString();
       const agentId = agent._id.toString();
 
+      // Check if this is a potential duplicate message
+      // Use a cache with unique request IDs to prevent duplicate processing
+      const requestId = `${telegramUserId}-${telegramChatId}-${Date.now()}`;
+      console.log(`[Controller] Request ID: ${requestId}`);
+
       // Store user message in conversation history
+      console.log(`[Controller] Storing user message in conversation history, userID: ${telegramUserId}, agentID: ${agentId}`);
       await memoryService.addMessage(telegramUserId, telegramChatId, agentId, 'user', userMessage);
 
       // Create initial message to update (early response)

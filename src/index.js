@@ -41,6 +41,50 @@ function setupHeartbeat() {
   }
 }
 
+// Simple request deduplication
+const processedMessages = new Map();
+const MESSAGE_DEDUP_TTL = 10000; // 10 seconds
+
+function isDuplicateRequest(userId, messageId, messageText) {
+  const key = `${userId}-${messageId}`;
+  const textKey = `${userId}-${messageText.substring(0, 20)}`;
+
+  // Check if we've seen this exact message ID recently
+  if (processedMessages.has(key)) {
+    console.log(`Detected duplicate message ID: ${key}`);
+    return true;
+  }
+
+  // Also check for same text from same user within short timeframe
+  const recentMessages = [...processedMessages.entries()]
+    .filter(([k, v]) => k.startsWith(`${userId}-`) && Date.now() - v.time < 3000);
+
+  for (const [, data] of recentMessages) {
+    if (data.text && data.text === messageText) {
+      console.log(`Detected duplicate text from user ${userId} within 3 seconds`);
+      return true;
+    }
+  }
+
+  // Store this message as processed
+  processedMessages.set(key, {
+    time: Date.now(),
+    text: messageText
+  });
+  processedMessages.set(textKey, {
+    time: Date.now(),
+    messageId
+  });
+
+  // Cleanup old entries
+  setTimeout(() => {
+    processedMessages.delete(key);
+    processedMessages.delete(textKey);
+  }, MESSAGE_DEDUP_TTL);
+
+  return false;
+}
+
 // Async function to fetch agents and user data
 async function initializeAgentData() {
   try {
@@ -147,9 +191,20 @@ async function initializeAgentData() {
 
                 // Handle text messages
                 bot.on(message('text'), async (ctx) => {
-                  console.log(`Message received from ${ctx.from.id} (${ctx.from.username || 'no username'}): ${ctx.message.text.substring(0, 50)}${ctx.message.text.length > 50 ? '...' : ''}`);
+                  const userId = ctx.from.id;
+                  const messageId = ctx.message.message_id;
+                  const messageText = ctx.message.text;
+
+                  console.log(`Message received from ${userId} (${ctx.from.username || 'no username'}): ${messageText.substring(0, 50)}${messageText.length > 50 ? '...' : ''}`);
+
+                  // Check for duplicate requests
+                  if (isDuplicateRequest(userId, messageId, messageText)) {
+                    console.log(`Skipping duplicate message ${messageId} from user ${userId}`);
+                    return;
+                  }
+
                   try {
-                    await messageController.processMessage(ctx.message.text, ctx, agent);
+                    await messageController.processMessage(messageText, ctx, agent);
                   } catch (error) {
                     console.error('Error processing message:', error);
                     ctx.reply('⚠️ An error occurred while processing your request.');
