@@ -8,12 +8,16 @@ const messageController = require('./controllers/messageController');
 const { connectDB } = require('./config/database');
 const Agent = require('./models/Agent');
 const User = require('./models/User');
+const moderationService = require('./services/moderationService');
 
 // Connect to the database
 connectDB();
 
 // Store active bots with their corresponding agent IDs and updatedAt timestamps
 const activeBots = new Map();
+
+// Track bot tokens to prevent duplicates
+const activeTokens = new Set();
 
 // Add heartbeat mechanism
 function setupHeartbeat() {
@@ -106,6 +110,13 @@ async function initializeAgentData() {
 
         const agentId = agent._id.toString();
         const currentUpdatedAt = new Date(agent.updatedAt).getTime();
+        const botToken = agent.summary.telegram.token;
+
+        // Check if we already have a bot with this token
+        if (activeTokens.has(botToken)) {
+          console.log(`WARNING: Bot token for ${agent.name} is already in use by another bot. Skipping to prevent conflicts.`);
+          continue;
+        }
 
         // Check if we already have this bot running
         const existingBot = activeBots.get(agentId);
@@ -117,6 +128,8 @@ async function initializeAgentData() {
         if (shouldRelaunchBot) {
           console.log(`Agent ${agent.name} has been modified, relaunching bot...`);
           try {
+            // Remove from active tokens set
+            activeTokens.delete(botToken);
             // Stop the existing bot
             await existingBot.bot.stop('UPDATE');
             console.log(`Successfully stopped bot for agent ${agent.name}`);
@@ -189,13 +202,252 @@ async function initializeAgentData() {
                   }
                 });
 
+                // Add test command for debugging
+                bot.command('test', async (ctx) => {
+                  console.log(`TEST command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                  console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}`);
+                  await ctx.reply('Test command received! Bot is working.');
+                });
+
+                // Special handler just for group commands
+                // bot.on(['text'], (ctx) => {
+                //   if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+                //     const messageText = ctx.message.text;
+
+                //     // Check if this is a command
+                //     if (messageText.startsWith('/')) {
+                //       console.log('GROUP COMMAND DETECTED');
+                //       console.log(`Group ID: ${ctx.chat.id}, Group Type: ${ctx.chat.type}`);
+                //       console.log(`Command text: ${messageText}`);
+                //       console.log(`From user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                //       console.log('Full message:', JSON.stringify(ctx.message, null, 2));
+
+                //       // Parse command
+                //       const parts = messageText.split(' ');
+                //       const command = parts[0].toLowerCase();
+                //       const commandName = command.split('@')[0].substring(1);
+
+                //       // Check if directed to this bot
+                //       const targetBot = command.includes('@') ? command.split('@')[1] : null;
+                //       const botUsername = ctx.botInfo.username;
+
+                //       console.log(`Command: ${commandName}, Target: ${targetBot || 'unspecified'}, My username: ${botUsername}`);
+
+                //       // If command is explicitly for another bot, or not for this bot
+                //       if (targetBot && targetBot !== botUsername) {
+                //         console.log(`Command is for another bot (${targetBot}), ignoring`);
+                //         return;
+                //       }
+
+                //       // For debug purposes, let's respond manually to test commands
+                //       if (commandName === 'test') {
+                //         console.log('Responding to test command in group');
+                //         ctx.reply('Group test command received! This is a direct handler response.').catch(err => {
+                //           console.error('Error sending test response:', err);
+                //         });
+                //       }
+
+                //       if (commandName === 'modstatus') {
+                //         console.log('Responding to modstatus command in group');
+                //         ctx.reply('Moderation status command received through direct handler.').catch(err => {
+                //           console.error('Error sending modstatus response:', err);
+                //         });
+                //       }
+                //     }
+                //   }
+                // });
+
+                // Debug handler for ANY update from Telegram
+                bot.use((ctx, next) => {
+                  console.log('====== RAW UPDATE RECEIVED ======');
+                  console.log(`Update type: ${ctx.updateType}`);
+                  console.log(`Chat ID: ${ctx.chat?.id}, Chat Type: ${ctx.chat?.type}`);
+
+                  // Check for message text in any form
+                  if (ctx.message?.text) {
+                    console.log(`MESSAGE TEXT: "${ctx.message.text}"`);
+                  }
+
+                  // Continue to the next middleware
+                  return next();
+                });
+
+                // Simple message listener to catch ANY text message
+                bot.on('text', (ctx) => {
+                  console.log('*** TEXT MESSAGE HANDLER TRIGGERED ***');
+                  console.log(`From user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                  console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}`);
+                  console.log(`Message: "${ctx.message.text}"`);
+
+                  // Test for a specific message to confirm reception
+                  if (ctx.message.text.toLowerCase() === 'testing bot') {
+                    ctx.reply('I can see your message! Bot is working.').catch(err => {
+                      console.error('Error replying to test message:', err);
+                    });
+                    return;
+                  }
+
+                  // Only process for moderation if in a group chat
+                  const isGroupChat = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+                  if (isGroupChat) {
+                    // Check if moderation is enabled for this agent
+                    const shouldModerate = agent.summary?.telegram?.moderation !== false;
+                    if (shouldModerate) {
+                      console.log(`Processing message for moderation in group ${ctx.chat.id}`);
+
+                      // Skip moderation for admin users
+                      ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id)
+                        .then(member => {
+                          // const isAdmin = ['creator', 'administrator'].includes(member.status);
+                          // if (isAdmin) {
+                          //   console.log(`Skipping moderation for admin user ${ctx.from.id}`);
+                          //   return;
+                          // }
+
+                          // Process with moderation
+                          moderationService.moderateMessage(ctx.message.text, ctx, agent)
+                            .then(result => {
+                              console.log(`Moderation result: ${JSON.stringify(result)}`);
+                            })
+                            .catch(error => {
+                              console.error('Error in moderation:', error);
+                            });
+                        })
+                        .catch(error => {
+                          console.error('Error checking user status:', error);
+                        });
+                    }
+                  }
+                });
+
+                // Add moderation-specific commands
+                bot.command('modstatus', async (ctx) => {
+                  console.log(`Moderation status command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                  // Only chat administrators can use this command
+                  try {
+                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                    const isAdmin = ['creator', 'administrator'].includes(member.status);
+
+                    if (!isAdmin) {
+                      return ctx.reply('Only administrators can use this command.');
+                    }
+
+                    // Get bot permissions
+                    const botMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
+                    const permissions = {
+                      canRestrictMembers: botMember.can_restrict_members,
+                      canDeleteMessages: botMember.can_delete_messages,
+                      canPinMessages: botMember.can_pin_messages
+                    };
+
+                    const statusMessage = `🤖 *Moderation Status*\n\n` +
+                      `*Bot Permissions*:\n` +
+                      `- Restrict Members: ${permissions.canRestrictMembers ? '✅' : '❌'}\n` +
+                      `- Delete Messages: ${permissions.canDeleteMessages ? '✅' : '❌'}\n` +
+                      `- Pin Messages: ${permissions.canPinMessages ? '✅' : '❌'}\n\n` +
+                      `*Moderation is ${agent.summary.telegram?.moderation ? 'enabled' : 'disabled'}*\n\n` +
+                      `Use /modon to enable moderation or /modoff to disable it.`;
+
+                    ctx.replyWithMarkdown(statusMessage);
+                  } catch (error) {
+                    console.error('Error checking moderation status:', error);
+                    ctx.reply('⚠️ An error occurred while checking moderation status.');
+                  }
+                });
+
+                bot.command('modon', async (ctx) => {
+                  console.log(`Moderation ON command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                  // Only chat administrators can use this command
+                  try {
+                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                    const isAdmin = ['creator', 'administrator'].includes(member.status);
+
+                    if (!isAdmin) {
+                      return ctx.reply('Only administrators can use this command.');
+                    }
+
+                    // Enable moderation for this agent in this chat
+                    if (!agent.summary.telegram) {
+                      agent.summary.telegram = {};
+                    }
+
+                    agent.summary.telegram.moderation = true;
+                    await Agent.findByIdAndUpdate(agent._id, {
+                      'summary.telegram.moderation': true
+                    });
+
+                    ctx.reply('✅ Moderation has been enabled for this group.');
+                  } catch (error) {
+                    console.error('Error enabling moderation:', error);
+                    ctx.reply('⚠️ An error occurred while enabling moderation.');
+                  }
+                });
+
+                bot.command('modoff', async (ctx) => {
+                  console.log(`Moderation OFF command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                  // Only chat administrators can use this command
+                  try {
+                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                    const isAdmin = ['creator', 'administrator'].includes(member.status);
+
+                    if (!isAdmin) {
+                      return ctx.reply('Only administrators can use this command.');
+                    }
+
+                    // Disable moderation for this agent in this chat
+                    if (!agent.summary.telegram) {
+                      agent.summary.telegram = {};
+                    }
+
+                    agent.summary.telegram.moderation = false;
+                    await Agent.findByIdAndUpdate(agent._id, {
+                      'summary.telegram.moderation': false
+                    });
+
+                    ctx.reply('❌ Moderation has been disabled for this group.');
+                  } catch (error) {
+                    console.error('Error disabling moderation:', error);
+                    ctx.reply('⚠️ An error occurred while disabling moderation.');
+                  }
+                });
+
+                // Catch-all handler to detect ANY updates
+                bot.on('message', (ctx) => {
+                  console.log('====== GENERIC MESSAGE RECEIVED ======');
+                  console.log(`Update type: ${ctx.updateType}, Chat type: ${ctx.chat.type}`);
+                  console.log('Update object:', JSON.stringify(ctx.update, null, 2));
+                });
+
                 // Handle text messages
                 bot.on(message('text'), async (ctx) => {
+                  // Very first line - log that we received something
+                  console.log('========= MESSAGE RECEIVED =========');
+                  console.log(`CHAT TYPE: ${ctx.chat.type} (${ctx.chat.id}), FROM: ${ctx.from.username || ctx.from.id}`);
+
+                  // Debug raw message for troubleshooting 
+                  console.log('Raw message object:', JSON.stringify(ctx.message, null, 2));
+                  console.log('Raw update object:', JSON.stringify(ctx.update, null, 2));
+
                   const userId = ctx.from.id;
                   const messageId = ctx.message.message_id;
                   const messageText = ctx.message.text;
+                  const isGroupChat = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
 
                   console.log(`Message received from ${userId} (${ctx.from.username || 'no username'}): ${messageText.substring(0, 50)}${messageText.length > 50 ? '...' : ''}`);
+                  console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}, Is group: ${isGroupChat}`);
+
+                  // Check if this is a command
+                  if (messageText.startsWith('/')) {
+                    const parts = messageText.split(' ');
+                    const command = parts[0].toLowerCase();
+
+                    // Strip bot username from command if present
+                    const commandName = command.split('@')[0].substring(1);
+                    console.log(`Detected command: ${commandName}`);
+
+                    // Let the command handlers work on it
+                    return;
+                  }
 
                   // Check for duplicate requests
                   if (isDuplicateRequest(userId, messageId, messageText)) {
@@ -204,7 +456,70 @@ async function initializeAgentData() {
                   }
 
                   try {
-                    await messageController.processMessage(messageText, ctx, agent);
+                    // Handle group chats differently - apply moderation if enabled
+                    if (isGroupChat) {
+                      console.log(`Processing group message from ${ctx.from.username || userId} in ${ctx.chat.title || 'a group'}`);
+
+                      // Check if moderation is enabled for this agent
+                      // Default to true if not explicitly set to false
+                      const shouldModerate = agent.summary?.telegram?.moderation !== false;
+                      console.log(`Moderation enabled for this agent? ${shouldModerate}`);
+
+                      if (shouldModerate) {
+                        console.log(`Moderation enabled for group ${ctx.chat.id}, analyzing message...`);
+
+                        // Get bot member to check permissions
+                        const botMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
+                        console.log(`Bot permissions: restrictMembers=${botMember.can_restrict_members}, deleteMessages=${botMember.can_delete_messages}`);
+
+                        // Check if the bot is not an admin, skip moderation
+                        if (!botMember.can_restrict_members && !botMember.can_delete_messages) {
+                          console.log(`Bot doesn't have moderation permissions in this group`);
+                          // Still process the message normally if it's directed to the bot
+                          if (messageText.includes(`@${ctx.botInfo.username}`) || ctx.message.reply_to_message?.from?.id === ctx.botInfo.id) {
+                            await messageController.processMessage(messageText, ctx, agent);
+                          }
+                          return;
+                        }
+
+                        // Skip moderation for admins
+                        const senderMember = await ctx.telegram.getChatMember(ctx.chat.id, userId);
+                        const isSenderAdmin = ['creator', 'administrator'].includes(senderMember.status);
+
+                        if (isSenderAdmin) {
+                          console.log(`Skipping moderation for admin user ${userId}`);
+                          // Still process the message if it's directed to the bot
+                          if (messageText.includes(`@${ctx.botInfo.username}`) || ctx.message.reply_to_message?.from?.id === ctx.botInfo.id) {
+                            await messageController.processMessage(messageText, ctx, agent);
+                          }
+                          return;
+                        }
+
+                        // Moderate the message
+                        console.log(`Sending message to moderation service for analysis`);
+                        const moderationResult = await moderationService.moderateMessage(messageText, ctx, agent);
+
+                        console.log(`Moderation result for message ${messageId}: ${JSON.stringify(moderationResult)}`);
+
+                        // If no action required or action was not successful, process the message normally
+                        // if directed to the bot
+                        if (!moderationResult.actionRequired || !moderationResult.actionTaken) {
+                          if (messageText.includes(`@${ctx.botInfo.username}`) || ctx.message.reply_to_message?.from?.id === ctx.botInfo.id) {
+                            await messageController.processMessage(messageText, ctx, agent);
+                          }
+                        }
+                      } else {
+                        // Moderation not enabled, process as normal if directed to the bot
+                        console.log(`Moderation not enabled, processing as normal chat`);
+                        if (messageText.includes(`@${ctx.botInfo.username}`) || ctx.message.reply_to_message?.from?.id === ctx.botInfo.id) {
+                          await messageController.processMessage(messageText, ctx, agent);
+                        }
+                      }
+                    } else {
+                      // Handle private chats normally (no moderation)
+                      console.log(`Processing private chat message`);
+                      await messageController.processMessage(messageText, ctx, agent);
+                    }
                   } catch (error) {
                     console.error('Error processing message:', error);
                     ctx.reply('⚠️ An error occurred while processing your request.');
@@ -215,8 +530,28 @@ async function initializeAgentData() {
                 bot.telegram.setMyCommands([
                   { command: 'start', description: 'Start the bot' },
                   { command: 'clearmemory', description: 'Clear your conversation history' },
-                  { command: 'showmemory', description: 'Show a summary of your conversation history' }
-                ]).then(() => {
+                  { command: 'showmemory', description: 'Show a summary of your conversation history' },
+                  { command: 'test', description: 'Test if the bot is working properly' },
+                  { command: 'modstatus', description: 'Check moderation status (admin only)' },
+                  { command: 'modon', description: 'Enable moderation (admin only)' },
+                  { command: 'modoff', description: 'Disable moderation (admin only)' }
+                ], { scope: { type: 'all_chat_administrators' } }).catch(error => {
+                  console.error('Failed to register admin commands:', error);
+                }).then(() => {
+                  // Also register for all users
+                  return bot.telegram.setMyCommands([
+                    { command: 'start', description: 'Start the bot' },
+                    { command: 'clearmemory', description: 'Clear your conversation history' },
+                    { command: 'showmemory', description: 'Show a summary of your conversation history' },
+                    { command: 'test', description: 'Test if the bot is working properly' }
+                  ], { scope: { type: 'all_private_chats' } });
+                }).then(() => {
+                  // Also register for default scope (all users in all chats)
+                  return bot.telegram.setMyCommands([
+                    { command: 'start', description: 'Start the bot' },
+                    { command: 'test', description: 'Test if the bot is working properly' }
+                  ]);
+                }).then(() => {
                   console.log('Bot commands registered with Telegram');
                 }).catch(error => {
                   console.error('Failed to register commands:', error);
@@ -228,6 +563,9 @@ async function initializeAgentData() {
                   bot.launch();
                   console.log('Bot launched successfully for agent:', agent.name);
 
+                  // Add token to active tokens set to prevent duplicates
+                  activeTokens.add(botToken);
+
                   // Store the bot in our active bots map
                   activeBots.set(agentId, {
                     bot: bot,
@@ -238,14 +576,18 @@ async function initializeAgentData() {
                   // Enable graceful stop for this specific bot
                   process.once('SIGINT', () => {
                     console.log('SIGINT received, stopping bot');
+                    activeTokens.delete(botToken);
                     bot.stop('SIGINT');
                   });
                   process.once('SIGTERM', () => {
                     console.log('SIGTERM received, stopping bot');
+                    activeTokens.delete(botToken);
                     bot.stop('SIGTERM');
                   });
                 } catch (error) {
                   console.error('Error starting bot:', error);
+                  // Clean up if launch fails
+                  activeTokens.delete(botToken);
                 }
               } catch (error) {
                 console.error(`Error creating bot for agent ${agent.name}:`, error);
@@ -266,6 +608,18 @@ async function initializeAgentData() {
           console.log(`Agent ${botInfo.name} no longer exists, stopping bot...`);
           try {
             await botInfo.bot.stop('REMOVED');
+            // Find and remove the token from activeTokens
+            let tokenToRemove = null;
+            for (const agent of agents) {
+              if (agent._id.toString() === agentId) {
+                tokenToRemove = agent.summary.telegram.token;
+                break;
+              }
+            }
+            if (tokenToRemove) {
+              activeTokens.delete(tokenToRemove);
+              console.log(`Removed token for deleted agent ${botInfo.name}`);
+            }
             activeBots.delete(agentId);
             console.log(`Successfully stopped and removed bot for deleted agent ${botInfo.name}`);
           } catch (error) {
@@ -301,7 +655,7 @@ function scheduleAgentUpdates(intervalMinutes = 1) {
   console.log('Initial setup complete');
 
   // Schedule periodic updates
-  scheduleAgentUpdates();
+  scheduleAgentUpdates(100);
   console.log('Agent update scheduler initialized');
 
   // Setup heartbeat mechanism

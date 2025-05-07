@@ -31,6 +31,23 @@ const agentSchema = new Schema(
     summary: {
       type: Object,
       required: true,
+      default: {},
+      // Define structure for the telegram configuration
+      telegram: {
+        type: Object,
+        default: {},
+        token: { type: String },
+        moderation: { type: Boolean, default: false },
+        moderationSettings: {
+          type: Object,
+          default: {},
+          deleteMessages: { type: Boolean, default: true },
+          warnUsers: { type: Boolean, default: true },
+          muteUsers: { type: Boolean, default: true },
+          kickUsers: { type: Boolean, default: true },
+          banUsers: { type: Boolean, default: false }
+        }
+      }
     },
     avatar: {
       type: String,
