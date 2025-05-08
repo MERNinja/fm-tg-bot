@@ -224,7 +224,7 @@ Message: ${message}`;
                     });
 
                     // Ban the user
-                    await ctx.telegram.kickChatMember(chatId, userId);
+                    await ctx.telegram.banChatMember(chatId, userId);
 
                     // Notify the group
                     await ctx.reply(`🚫 User @${ctx.from.username || userId} has been banned due to: ${decision.reason}`);
