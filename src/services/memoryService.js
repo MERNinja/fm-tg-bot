@@ -15,6 +15,22 @@ class MemoryService {
      */
     async getOrCreateConversation(telegramUserId, telegramChatId, agentId) {
         try {
+            // Handle potential undefined or invalid IDs 
+            if (!telegramUserId || telegramUserId === 'undefined' || telegramUserId === 'unknown') {
+                telegramUserId = 'anonymous_user';
+                console.log(`[Memory] Warning: Invalid user ID, using ${telegramUserId} instead`);
+            }
+
+            if (!telegramChatId || telegramChatId === 'undefined') {
+                telegramChatId = telegramUserId;
+                console.log(`[Memory] Warning: Invalid chat ID, using user ID (${telegramChatId}) instead`);
+            }
+
+            if (!agentId || agentId === 'undefined') {
+                console.error(`[Memory] Error: Missing agent ID, cannot create conversation`);
+                return null;
+            }
+
             console.log(`[Memory] Looking for conversation: User=${telegramUserId}, Chat=${telegramChatId}, Agent=${agentId}`);
 
             let conversation = await Conversation.findOne({
@@ -84,6 +100,22 @@ class MemoryService {
      */
     async addMessage(telegramUserId, telegramChatId, agentId, role, content) {
         try {
+            // Handle potential undefined or invalid values
+            if (!telegramUserId || telegramUserId === 'undefined' || telegramUserId === 'unknown') {
+                telegramUserId = 'anonymous_user';
+                console.log(`[Memory] Warning: Invalid user ID, using ${telegramUserId} instead for message storage`);
+            }
+
+            if (!telegramChatId || telegramChatId === 'undefined') {
+                telegramChatId = telegramUserId;
+                console.log(`[Memory] Warning: Invalid chat ID, using user ID (${telegramChatId}) instead for message storage`);
+            }
+
+            if (!agentId || agentId === 'undefined') {
+                console.error(`[Memory] Error: Missing agent ID, cannot store message`);
+                return null;
+            }
+
             console.log(`[Memory] Adding message: User=${telegramUserId}, Role=${role}, ContentLength=${content?.length || 0}`);
 
             // Validate content - don't store empty messages
@@ -148,6 +180,22 @@ class MemoryService {
      */
     async getConversationHistory(telegramUserId, telegramChatId, agentId, limit = 20) {
         try {
+            // Handle potential undefined or invalid values
+            if (!telegramUserId || telegramUserId === 'undefined' || telegramUserId === 'unknown') {
+                telegramUserId = 'anonymous_user';
+                console.log(`[Memory] Warning: Invalid user ID, using ${telegramUserId} instead for retrieving history`);
+            }
+
+            if (!telegramChatId || telegramChatId === 'undefined') {
+                telegramChatId = telegramUserId;
+                console.log(`[Memory] Warning: Invalid chat ID, using user ID (${telegramChatId}) instead for retrieving history`);
+            }
+
+            if (!agentId || agentId === 'undefined') {
+                console.error(`[Memory] Error: Missing agent ID, cannot retrieve conversation history`);
+                return [];
+            }
+
             console.log(`[Memory] Getting conversation history: User=${telegramUserId}, Limit=${limit}`);
 
             const conversation = await this.getOrCreateConversation(telegramUserId, telegramChatId, agentId);

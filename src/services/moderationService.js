@@ -9,6 +9,8 @@
 
 const fullmetalService = require('./fullmetalService');
 const memoryService = require('./memoryService');
+const warningService = require('./warningService');
+const UserWarning = require('../models/UserWarning');
 
 class ModerationService {
     /**
@@ -21,6 +23,43 @@ class ModerationService {
      */
     async moderateMessage(message, ctx, agent, takeAction = true) {
         try {
+            // First check if the user is an admin - if so, skip moderation actions
+            let isAdmin = false;
+            try {
+                if (ctx.from && ctx.chat) {
+                    // Skip all channel operations as the bot isn't needed for channels
+                    if (ctx.chat.type === 'channel') {
+                        console.log(`[ModerationService] Message is from a channel, skipping as bot is not needed for channels`);
+                        return {
+                            actionRequired: false,
+                            reason: 'Bot not needed for channels',
+                            action: 'none',
+                            actionTaken: false
+                        };
+                    }
+
+                    // For groups and supergroups, check admin status
+                    if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+                        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                        isAdmin = ['creator', 'administrator'].includes(member.status);
+
+                        if (isAdmin) {
+                            console.log(`[ModerationService] User ${ctx.from.id} is an admin, skipping moderation`);
+                            return {
+                                actionRequired: false,
+                                reason: 'User is an admin',
+                                action: 'none',
+                                isAdmin: true,
+                                actionTaken: false
+                            };
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('[ModerationService] Error checking admin status:', error);
+                // Continue with moderation if we can't verify admin status
+            }
+
             const messageWithContext = this.#buildModerationPrompt(message, ctx);
             console.log(`[ModerationService] Analyzing message for moderation`);
 
@@ -194,8 +233,42 @@ Message: ${message}`;
         const chatId = ctx.chat.id;
         const messageId = ctx.message.message_id;
 
+        // Skip all channel operations as the bot isn't needed for channels
+        if (ctx.chat.type === 'channel') {
+            console.log(`[ModerationService] Cannot take action in channels as bot is not needed for channels`);
+            return {
+                success: false,
+                action: 'none',
+                error: 'Bot not needed for channels'
+            };
+        }
+
+        // Double-check if user is an admin before taking any action
+        let isAdmin = false;
+        try {
+            // For groups and supergroups, check admin status
+            if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+                const member = await ctx.telegram.getChatMember(chatId, userId);
+                isAdmin = ['creator', 'administrator'].includes(member.status);
+            }
+
+            if (isAdmin) {
+                console.log(`[ModerationService] Cannot take action against admin user ${userId}`);
+                return {
+                    success: false,
+                    action: 'none',
+                    error: 'Cannot moderate admin users',
+                    isAdmin: true
+                };
+            }
+        } catch (error) {
+            console.error('[ModerationService] Error checking admin status before action:', error);
+            // Continue with the action if we can't verify admin status, but log the error
+        }
+
         console.log(`[ModerationService] Taking action: ${decision.action} for user ${userId} in chat ${chatId}`);
         console.log(ctx.from);
+
         switch (decision.action) {
             case 'none':
                 // No action needed
@@ -204,12 +277,57 @@ Message: ${message}`;
             case 'warn':
                 // Warn the user
                 try {
-                    await ctx.reply(`⚠️ Warning to @${ctx.from.username || userId}: ${decision.reason}`);
+                    // Track this warning in the warning service
+                    const warningResult = await warningService.addWarning(ctx, decision.reason, {
+                        _id: ctx.botInfo?.id?.toString() || 'unknown'
+                    });
 
-                    // Store warning in moderation history (could be implemented with a database)
+                    // Get the warning count
+                    const warningCount = warningResult.warningCount || 1;
+
+                    // Format warning reason
+                    const warningReason = decision.reason || 'Violation of group rules';
+
+                    // Add warning count to message
+                    let warningMessage = `⚠️ Warning to @${ctx.from.username || userId}: ${warningReason}`;
+
+                    // Check if this warning triggered an action through warning service
+                    if (warningResult.action && warningResult.action !== 'warning_recorded') {
+                        // In this case, no need to send our own message since warning service already sent notifications
+                        console.log(`[ModerationService] Warning action escalated to ${warningResult.action}`);
+                        return {
+                            success: true,
+                            action: 'warn',
+                            warningCount,
+                            escalated: warningResult.action
+                        };
+                    }
+
+                    // No escalation, send normal warning message with count
+                    warningMessage += `\n\n*Warning count: ${warningCount}/${warningService.WARNING_THRESHOLDS.BAN}*\n`;
+
+                    // Add information about thresholds
+                    if (warningCount === 1) {
+                        warningMessage += `\nAfter ${warningService.WARNING_THRESHOLDS.TEMP_MUTE} warnings: 1 hour mute
+After ${warningService.WARNING_THRESHOLDS.KICK} warnings: Removal from group
+After ${warningService.WARNING_THRESHOLDS.BAN} warnings: Permanent ban`;
+                    } else if (warningCount >= warningService.WARNING_THRESHOLDS.TEMP_MUTE - 1) {
+                        const remainingUntilBan = warningService.WARNING_THRESHOLDS.BAN - warningCount;
+                        warningMessage += `\n⚠️ *${remainingUntilBan} more warning${remainingUntilBan !== 1 ? 's' : ''} until permanent ban*`;
+                    }
+
+                    // Send the warning message
+                    await ctx.reply(warningMessage, { parse_mode: 'Markdown' });
+
+                    // Store warning in moderation history
                     console.log(`[ModerationService] Warning issued to user ${userId} for: ${decision.reason}`);
 
-                    return { success: true, action: 'warn' };
+                    return {
+                        success: true,
+                        action: 'warn',
+                        warningCount,
+                        warningResult
+                    };
                 } catch (error) {
                     console.error('[ModerationService] Error issuing warning:', error);
                     return { success: false, action: 'warn', error: error.message };
@@ -223,13 +341,36 @@ Message: ${message}`;
                         console.error('[ModerationService] Error deleting banned message:', error);
                     });
 
-                    // Ban the user
+                    // Record this as a severe violation in warning service (5 warnings at once, leading to ban)
+                    await warningService.addWarning(ctx, `Severe violation: ${decision.reason}`, {
+                        _id: ctx.botInfo?.id?.toString() || 'unknown'
+                    });
+
+                    // Force set to 5 warnings to trigger ban
+                    const warningRecord = await UserWarning.findOne({
+                        telegramUserId: userId.toString(),
+                        telegramChatId: chatId.toString()
+                    });
+
+                    if (warningRecord) {
+                        warningRecord.warningCount = warningService.WARNING_THRESHOLDS.BAN;
+                        await warningRecord.save();
+
+                        // Let warning service handle the ban for consistency
+                        const banResult = await warningService.checkThresholdAndTakeAction(ctx, warningRecord);
+
+                        if (banResult === 'banned') {
+                            return { success: true, action: 'ban', method: 'warning_service' };
+                        }
+                    }
+
+                    // If warning service ban failed or record not found, do direct ban
                     await ctx.telegram.banChatMember(chatId, userId);
 
                     // Notify the group
                     await ctx.reply(`🚫 User @${ctx.from.username || userId} has been banned due to: ${decision.reason}`);
 
-                    return { success: true, action: 'ban' };
+                    return { success: true, action: 'ban', method: 'direct' };
                 } catch (error) {
                     console.error('[ModerationService] Error banning user:', error);
                     return { success: false, action: 'ban', error: error.message };

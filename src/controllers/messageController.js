@@ -18,10 +18,11 @@ class MessageController {
   async processMessage(userMessage, ctx, agent) {
     
     try {
-      console.log(`[Controller] Processing message from user: ${ctx.from.id}, text: "${userMessage.substring(0, 50)}${userMessage.length > 50 ? '...' : ''}"`);
+      console.log(`[Controller] Processing message from user: ${ctx.from?.id || 'unknown'}, text: "${userMessage.substring(0, 50)}${userMessage.length > 50 ? '...' : ''}"`);
 
-      const telegramUserId = ctx.from.id.toString();
-      const telegramChatId = ctx.chat.id.toString();
+      // Handle case where ctx.from might be missing (like in some channel posts)
+      const telegramUserId = (ctx.from?.id || ctx.chat?.id || 'unknown').toString();
+      const telegramChatId = ctx.chat?.id?.toString() || telegramUserId;
       const agentId = agent._id.toString();
 
       // Check if this is a potential duplicate message
@@ -42,10 +43,20 @@ class MessageController {
         console.log(`[Controller] Building context from history for user: ${telegramUserId}`);
         const conversationContext = await memoryService.buildContextFromHistory(telegramUserId, telegramChatId, agentId);
 
+        // Determine the type of chat we're in for better context
+        const chatTypeContext = ctx.chat?.type === 'private'
+          ? 'private chat'
+          : ctx.chat?.type === 'channel'
+            ? `channel "${ctx.chat?.title || 'unnamed'}"`
+            : `${ctx.chat?.type || 'group'} "${ctx.chat?.title || 'unnamed'}"`;
+
         // If we have conversation context, add it to the message
-        const messageWithContext = conversationContext
+        let messageWithContext = conversationContext
           ? `${conversationContext}\n\nUser's current message: ${userMessage}`
           : userMessage;
+
+        // Add chat type information for better context awareness
+        messageWithContext = `[This message is from a ${chatTypeContext}]\n${messageWithContext}`;
 
         console.log(`[Controller] Sending request to Fullmetal API, context length: ${messageWithContext.length}`);
 
