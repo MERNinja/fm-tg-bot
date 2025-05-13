@@ -1,0 +1,949 @@
+const { Telegraf, session } = require('telegraf');
+const { message } = require('telegraf/filters');
+require('dotenv').config();
+const fs = require('fs');
+
+// Import controllers and services
+const messageController = require('./controllers/messageController');
+const { connectDB } = require('./config/database');
+const Agent = require('./models/Agent');
+const User = require('./models/User');
+const moderationService = require('./services/moderationService');
+const warningService = require('./services/warningService');
+
+// Connect to the database
+connectDB();
+
+// Store active bots with their corresponding agent IDs and updatedAt timestamps
+const activeBots = new Map();
+
+// Track bot tokens to prevent duplicates
+const activeTokens = new Set();
+
+// Add heartbeat mechanism
+function setupHeartbeat() {
+  if (process.env.NODE_HEARTBEAT_FILE && process.env.NODE_HEARTBEAT_INTERVAL) {
+    const heartbeatFile = process.env.NODE_HEARTBEAT_FILE;
+    const interval = parseInt(process.env.NODE_HEARTBEAT_INTERVAL) || 30000;
+
+    console.log(`Setting up heartbeat mechanism (interval: ${interval}ms, file: ${heartbeatFile})`);
+
+    // Update heartbeat regularly
+    setInterval(() => {
+      try {
+        fs.writeFileSync(heartbeatFile, Date.now().toString());
+      } catch (error) {
+        console.error(`Error writing heartbeat: ${error.message}`);
+      }
+    }, interval);
+
+    // Also update on certain events
+    process.on('message', () => {
+      try {
+        fs.writeFileSync(heartbeatFile, Date.now().toString());
+      } catch (error) { /* ignore */ }
+    });
+  }
+}
+
+// Simple request deduplication
+const processedMessages = new Map();
+const MESSAGE_DEDUP_TTL = 10000; // 10 seconds
+
+function isDuplicateRequest(userId, messageId, messageText) {
+  const key = `${userId}-${messageId}`;
+  const textKey = `${userId}-${messageText.substring(0, 20)}`;
+
+  // Check if we've seen this exact message ID recently
+  if (processedMessages.has(key)) {
+    console.log(`Detected duplicate message ID: ${key}`);
+    return true;
+  }
+
+  // Also check for same text from same user within short timeframe
+  const recentMessages = [...processedMessages.entries()]
+    .filter(([k, v]) => k.startsWith(`${userId}-`) && Date.now() - v.time < 3000);
+
+  for (const [, data] of recentMessages) {
+    if (data.text && data.text === messageText) {
+      console.log(`Detected duplicate text from user ${userId} within 3 seconds`);
+      return true;
+    }
+  }
+
+  // Store this message as processed
+  processedMessages.set(key, {
+    time: Date.now(),
+    text: messageText
+  });
+  processedMessages.set(textKey, {
+    time: Date.now(),
+    messageId
+  });
+
+  // Cleanup old entries
+  setTimeout(() => {
+    processedMessages.delete(key);
+    processedMessages.delete(textKey);
+  }, MESSAGE_DEDUP_TTL);
+
+  return false;
+}
+
+// Async function to fetch agents and user data
+async function initializeAgentData() {
+  try {
+    console.log('Fetching agents with Telegram tokens...');
+    // Find agents with valid Telegram tokens and populate the user data in a single query
+    const agents = await Agent.find({
+      'summary.telegram.token': { $exists: true, $ne: null }
+    }).populate('userId');
+
+    if (agents.length > 0) {
+      console.log(`Found ${agents.length} agents with Telegram tokens`);
+
+      // Loop through agents for setup and bot initialization
+      for (const agent of agents) {
+        try {
+          console.log(`Agent: ${agent.name}`);
+          console.log(`  ID: ${agent._id}`);
+          console.log(`  Token: ${agent.summary.telegram.token.substring(0, 10)}...`);
+
+          const agentId = agent._id.toString();
+          const currentUpdatedAt = new Date(agent.updatedAt).getTime();
+          const botToken = agent.summary.telegram.token;
+
+          // Check if we already have a bot with this token
+          if (activeTokens.has(botToken)) {
+            console.log(`WARNING: Bot token for ${agent.name} is already in use by another bot. Skipping to prevent conflicts.`);
+            continue;
+          }
+
+          // Check if we already have this bot running
+          const existingBot = activeBots.get(agentId);
+
+          // Determine if we need to launch a new bot or relaunch an existing one
+          const shouldLaunchNewBot = !existingBot;
+          const shouldRelaunchBot = existingBot && currentUpdatedAt > existingBot.updatedAt;
+
+          if (shouldRelaunchBot) {
+            console.log(`Agent ${agent.name} has been modified, relaunching bot...`);
+            try {
+              // Remove from active tokens set
+              activeTokens.delete(botToken);
+              // Stop the existing bot
+              await existingBot.bot.stop('UPDATE');
+              console.log(`Successfully stopped bot for agent ${agent.name}`);
+            } catch (error) {
+              console.error(`Error stopping bot for agent ${agent.name}:`, error);
+            }
+          }
+
+          if (shouldLaunchNewBot || shouldRelaunchBot) {
+            // Check if user data is available
+            if (agent.userId && agent.userId.apiKey && agent.userId.apiKey.length > 0) {
+              console.log(`  User: ${agent.userId.name || agent.userId.email || 'Unknown'}`);
+              console.log(`  API Key: ${agent.userId.apiKey[0].substring(0, 5)}...`);
+
+              // Get user data directly from the populated field
+              const user = agent.userId;
+
+              if (user && user.apiKey) {
+                console.log('User API key found and loaded');
+                console.log(`User: ${user.name || user.email || 'Unknown'}, ID: ${user._id}`);
+              } else {
+                console.log('No user API key found, using default');
+              }
+
+              if (agent._id) {
+                try {
+                  // Initialize the bot with extended timeout options
+                  const bot = new Telegraf(agent.summary.telegram.token, {
+                    telegram: {
+                      // API timeout in ms (default: 30000ms)
+                      apiTimeout: 180000, // 3 minutes
+                      // Polling parameters for webhook mode
+                      webhookReply: false
+                    },
+                    // Telegram client options
+                    handlerTimeout: 180000 // 3 minutes handler timeout
+                  });
+                  console.log('Bot initialized:', agent.summary.telegram.token.substring(0, 10) + '...', agent.name);
+
+                  // Add session middleware to store user states
+                  bot.use(session());
+                  console.log('Session middleware enabled');
+
+                  // Wait for 1 second before continuing
+                  console.log('Waiting 1 second before starting the bot...');
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  console.log('Wait complete, continuing bot initialization...');
+
+                  // Bot commands
+                  bot.start((ctx) => {
+                    console.log(`Start command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+
+                    // Check if this is a private chat (only show full menu in private chats)
+                    if (ctx.chat.type !== 'private') {
+                      const welcomeMessage = `👋 Hi! I'm ${agent.name}. ${agent.summary.description ? `${agent.summary.description}\n\n` : ''} Feel free to start chatting with me!`;
+                      ctx.reply(welcomeMessage);
+                      return;
+                    }
+
+                    // Create welcome message with inline keyboard menu
+                    const welcomeMessage = `👋 Welcome to ${agent.name}!\n\n` +
+                      `I'm an advanced AI chatbot powered by Fullmetal AI. I can help moderate your groups, answer questions, and more.\n\n` +
+                      `Please select an option below to get started:`;
+
+                    // Create inline keyboard buttons
+                    const keyboard = {
+                      inline_keyboard: [
+                        [
+                          {
+                            text: '🔑 Enter Fullmetal API Key',
+                            callback_data: 'setup_apikey'
+                          }
+                        ],
+                        [
+                          {
+                            text: '➕ Add to Group',
+                            url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
+                          }
+                        ],
+                        [
+                          {
+                            text: '👮‍♂️ Give Admin Access',
+                            callback_data: 'setup_admin'
+                          }
+                        ],
+                        [
+                          {
+                            text: '📚 Help & Commands',
+                            callback_data: 'show_help'
+                          }
+                        ]
+                      ]
+                    };
+
+                    // Send the welcome message with inline keyboard
+                    ctx.reply(welcomeMessage, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                  });
+
+                  // Handle callback queries from inline buttons
+                  bot.on('callback_query', async (ctx) => {
+                    console.log(`Callback query received: ${ctx.callbackQuery.data} from user: ${ctx.from.id}`);
+
+                    const callbackData = ctx.callbackQuery.data;
+
+                    // Process different callback actions
+                    switch (callbackData) {
+                      case 'setup_apikey':
+                        await handleApiKeySetup(ctx);
+                        break;
+
+                      case 'setup_admin':
+                        await handleAdminSetup(ctx);
+                        break;
+
+                      case 'show_help':
+                        await handleShowHelp(ctx);
+                        break;
+
+                      case 'back_to_main':
+                        await ctx.answerCbQuery('Returning to main menu...');
+
+                        // Re-show the welcome message with inline keyboard menu
+                        const welcomeMessage = `👋 Welcome back to ${agent.name}!\n\nPlease select an option:`;
+
+                        // Create inline keyboard buttons (same as in start command)
+                        const keyboard = {
+                          inline_keyboard: [
+                            [
+                              {
+                                text: '🔑 Enter Fullmetal API Key',
+                                callback_data: 'setup_apikey'
+                              }
+                            ],
+                            [
+                              {
+                                text: '➕ Add to Group',
+                                url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
+                              }
+                            ],
+                            [
+                              {
+                                text: '👮‍♂️ Give Admin Access',
+                                callback_data: 'setup_admin'
+                              }
+                            ],
+                            [
+                              {
+                                text: '📚 Help & Commands',
+                                callback_data: 'show_help'
+                              }
+                            ]
+                          ]
+                        };
+
+                        // Edit the current message instead of sending a new one
+                        await ctx.editMessageText(welcomeMessage, {
+                          reply_markup: keyboard,
+                          parse_mode: 'Markdown'
+                        });
+                        break;
+
+                      case 'list_groups':
+                        await ctx.answerCbQuery('Fetching your groups...');
+
+                        try {
+                          // This is a placeholder as Telegram doesn't provide a direct API to list user's groups
+                          // Instead, we'll ask the user to add the bot to their groups
+                          const message =
+                            `To see your groups with this bot:\n\n` +
+                            `1. Add the bot to your groups first using the "Add to Group" button\n` +
+                            `2. Make sure the bot is an admin in those groups\n\n` +
+                            `Alternatively, you can invite the bot to a group using this link:\n` +
+                            `https://t.me/${ctx.botInfo.username}?startgroup=true`;
+
+                          const groupsKeyboard = {
+                            inline_keyboard: [
+                              [{ text: '➕ Add to Group', url: `https://t.me/${ctx.botInfo.username}?startgroup=true` }],
+                              [{ text: '« Back', callback_data: 'setup_admin' }]
+                            ]
+                          };
+
+                          await ctx.editMessageText(message, { reply_markup: groupsKeyboard });
+                        } catch (error) {
+                          console.error('Error listing groups:', error);
+                          await ctx.reply('Error fetching groups. Please try again later.');
+                        }
+                        break;
+
+                      default:
+                        if (callbackData.startsWith('group_')) {
+                          await handleGroupSelection(ctx, callbackData.replace('group_', ''));
+                        } else {
+                          console.log(`Unknown callback query: ${callbackData}`);
+                          await ctx.answerCbQuery('This feature is not implemented yet.');
+                        }
+                    }
+                  });
+
+                  // Function to handle the API key setup flow
+                  async function handleApiKeySetup(ctx) {
+                    await ctx.answerCbQuery('Setting up your Fullmetal API Key...');
+
+                    // Create session data for this user if it doesn't exist
+                    if (!ctx.session) ctx.session = {};
+
+                    // Set waiting flag
+                    ctx.session.waitingForApiKey = true;
+
+                    const message =
+                      `Please enter your Fullmetal API Key.\n\n` +
+                      `You can get your API key from https://www.fullmetal.ai\n\n` +
+                      `Reply directly to this message with your API key, or type /cancel to abort.`;
+
+                    const sentMsg = await ctx.reply(message);
+                    ctx.session.apiKeyMessageId = sentMsg.message_id;
+
+                    console.log(`Waiting for API key from user ${ctx.from.id}, session:`, ctx.session);
+
+                    // Add a way for the user to go back to the main menu
+                    const keyboard = {
+                      inline_keyboard: [
+                        [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                      ]
+                    };
+
+                    await ctx.reply('Type /cancel to abort this setup.', { reply_markup: keyboard });
+                  }
+
+                  // Add handler to process API key submissions - using hears to prioritize this over other handlers
+                  bot.hears(/^[A-Za-z0-9_\-\.]+$/, async (ctx) => {
+                    // Check if we're waiting for an API key from this user
+                    if (ctx.session?.waitingForApiKey) {
+                      const apiKey = ctx.message.text.trim();
+                      console.log(`Received potential API key from user ${ctx.from.id}: ${apiKey.substring(0, 5)}...`);
+                      console.log(`Current session state:`, ctx.session);
+
+                      // Clear the waiting state
+                      ctx.session.waitingForApiKey = false;
+
+                      try {
+                        // Check if this is a valid API key in our database
+                        console.log(`Searching for user with API key starting with: ${apiKey.substring(0, 5)}...`);
+
+                        // Try first with exact match in array
+                        let user = await User.findOne({ apiKey: { $in: [apiKey] } });
+
+                        if (!user) {
+                          console.log("No match with array $in query, trying direct match...");
+                          user = await User.findOne({ apiKey: apiKey });
+                        }
+
+                        console.log(`Search result:`, user ? `Found user: ${user._id}` : "No user found");
+
+                        if (user) {
+                          // Valid API key found
+                          console.log(`Valid API key for user: ${user.email || user._id}`);
+
+                          // Update user with Telegram information
+                          await User.findByIdAndUpdate(user._id, {
+                            telegramId: ctx.from.id.toString(),
+                            telegramUsername: ctx.from.username || ''
+                          });
+
+                          console.log(`Updated user ${user._id} with Telegram ID ${ctx.from.id}`);
+
+                          // Show success message
+                          await ctx.reply(`✅ API key validated successfully!\n\nYou can now use ${agent.name} with your Fullmetal AI account.`);
+
+                          // Return to main menu
+                          const welcomeMessage = `👋 Welcome back to ${agent.name}!\n\nPlease select an option:`;
+                          const keyboard = {
+                            inline_keyboard: [
+                              [
+                                {
+                                  text: '🔑 Enter Fullmetal API Key',
+                                  callback_data: 'setup_apikey'
+                                }
+                              ],
+                              [
+                                {
+                                  text: '➕ Add to Group',
+                                  url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
+                                }
+                              ],
+                              [
+                                {
+                                  text: '👮‍♂️ Give Admin Access',
+                                  callback_data: 'setup_admin'
+                                }
+                              ],
+                              [
+                                {
+                                  text: '📚 Help & Commands',
+                                  callback_data: 'show_help'
+                                }
+                              ]
+                            ]
+                          };
+
+                          await ctx.reply(welcomeMessage, {
+                            reply_markup: keyboard,
+                            parse_mode: 'Markdown'
+                          });
+                        } else {
+                          // Invalid API key
+                          console.log(`Invalid API key attempt from user ${ctx.from.id}`);
+                          await ctx.reply('❌ Invalid API key. Please try again with a valid Fullmetal API key or type /cancel to abort.');
+
+                          // Reset waiting state to allow another attempt
+                          ctx.session.waitingForApiKey = true;
+                        }
+                      } catch (error) {
+                        console.error('Error validating API key:', error);
+                        await ctx.reply('⚠️ An error occurred while validating your API key. Please try again later.');
+                      }
+                    }
+                  });
+
+                  // Generic text handler for when not caught by other handlers
+                  bot.on('text', async (ctx) => {
+                    // Skip if this is a command
+                    if (ctx.message?.text?.startsWith('/')) return;
+
+                    // Check if we're waiting for an API key but text didn't match API key pattern
+                    if (ctx.session?.waitingForApiKey) {
+                      console.log(`Received text but not valid API key pattern from user ${ctx.from.id}`);
+                      await ctx.reply('That doesn\'t look like a valid API key format. Please try again or type /cancel to abort.');
+                    }
+                  });
+
+                  // Function to handle the admin setup flow
+                  async function handleAdminSetup(ctx) {
+                    await ctx.answerCbQuery('Setting up admin access...');
+
+                    const message =
+                      `To give me admin access to your group:\n\n` +
+                      `1. Go to your group\n` +
+                      `2. Click on the group name at the top\n` +
+                      `3. Select "Administrators"\n` +
+                      `4. Tap "Add Administrator"\n` +
+                      `5. Select this bot (@${ctx.botInfo.username})\n\n` +
+                      `Bot needs these permissions for moderation:\n` +
+                      `- Delete messages\n` +
+                      `- Ban users\n` +
+                      `- Restrict users`;
+
+                    // Add a button to show user's groups
+                    const keyboard = {
+                      inline_keyboard: [
+                        [{ text: 'Select a Group', callback_data: 'list_groups' }],
+                        [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                      ]
+                    };
+
+                    await ctx.reply(message, { reply_markup: keyboard });
+                  }
+
+                  // Function to handle showing help information
+                  async function handleShowHelp(ctx) {
+                    await ctx.answerCbQuery('Showing help information...');
+
+                    const helpMessage =
+                      `*Available Commands:*\n\n` +
+                      `/start - Show this menu\n` +
+                      `/clearmemory - Clear your conversation history\n` +
+                      `/showmemory - Show a summary of your conversation history\n` +
+                      `/warnings - Check warnings for a user (admin only)\n` +
+                      `/clearwarnings - Clear warnings for a user (admin only)\n` +
+                      `/modstatus - Check moderation status in a group (admin only)\n` +
+                      `/modon - Enable moderation in a group (admin only)\n` +
+                      `/modoff - Disable moderation in a group (admin only)\n` +
+                      `/test - Test if the bot is working properly\n\n` +
+
+                      `*Moderation Features:*\n` +
+                      `• Auto-warning system with ${warningService.WARNING_THRESHOLDS.BAN} strikes before ban\n` +
+                      `• Content filtering through Fullmetal AI\n` +
+                      `• Automatic actions against spam and harmful content`;
+
+                    const keyboard = {
+                      inline_keyboard: [
+                        [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                      ]
+                    };
+
+                    await ctx.reply(helpMessage, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                  }
+
+                  // Function to handle listing and selecting groups
+                  async function handleGroupSelection(ctx, groupId) {
+                    await ctx.answerCbQuery(`You selected group with ID: ${groupId}`);
+                    // Implement actual group selection logic here
+                    await ctx.reply(`Group selection is under development. Selected group ID: ${groupId}`);
+                  }
+
+                  // Add memory-related commands
+                  bot.command('clearmemory', async (ctx) => {
+                    console.log(`Clear memory command received from user: ${ctx.from.id}`);
+                    try {
+                      await messageController.clearMemory(ctx, agent);
+                    } catch (error) {
+                      console.error('Error clearing memory:', error);
+                      ctx.reply('⚠️ An error occurred while clearing conversation history.');
+                    }
+                  });
+
+                  bot.command('showmemory', async (ctx) => {
+                    console.log(`Show memory command received from user: ${ctx.from.id}`);
+                    try {
+                      await messageController.showMemory(ctx, agent);
+                    } catch (error) {
+                      console.error('Error showing memory:', error);
+                      ctx.reply('⚠️ An error occurred while retrieving conversation history.');
+                    }
+                  });
+
+                  // Add test command for debugging
+                  bot.command('test', async (ctx) => {
+                    console.log(`TEST command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                    console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}`);
+                    await ctx.reply('Test command received! Bot is working.');
+                  });
+
+                  // Debug handler for ANY update from Telegram
+                  bot.use((ctx, next) => {
+                    console.log('====== RAW UPDATE RECEIVED ======');
+                    console.log(`Update type: ${ctx.updateType}`);
+                    console.log(`Chat ID: ${ctx.chat?.id}, Chat Type: ${ctx.chat?.type}`);
+
+                    // Check for message text in any form
+                    if (ctx.message?.text) {
+                      console.log(`MESSAGE TEXT: "${ctx.message.text}"`);
+                    } else if (ctx.channelPost?.text) {
+                      console.log(`CHANNEL POST TEXT: "${ctx.channelPost.text}"`);
+                    }
+
+                    // Continue to the next middleware
+                    return next();
+                  });
+
+                  // Simple message listener to catch ANY text message
+                  bot.on('text', (ctx) => {
+                    console.log('*** TEXT MESSAGE HANDLER TRIGGERED ***');
+                    console.log(`From user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                    console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}`);
+                    console.log(`Message: "${ctx.message.text}"`);
+
+                    // Test for a specific message to confirm reception
+                    if (ctx.message.text.toLowerCase() === 'testing bot') {
+                      ctx.reply('I can see your message! Bot is working.').catch(err => {
+                        console.error('Error replying to test message:', err);
+                      });
+                      return;
+                    }
+
+                    // Only process for moderation if in a group chat
+                    const isGroupChat = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+                    if (isGroupChat) {
+                      // Check if moderation is enabled for this agent
+                      const shouldModerate = agent.summary?.telegram?.moderation !== false;
+                      if (shouldModerate) {
+                        console.log(`Processing message for moderation in group ${ctx.chat.id}`);
+
+                        // Skip moderation for admin users
+                        ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id)
+                          .then(member => {
+                        // const isAdmin = ['creator', 'administrator'].includes(member.status);
+                        // if (isAdmin) {
+                        //   console.log(`Skipping moderation for admin user ${ctx.from.id}`);
+                        //   return;
+                        // }
+
+                            // Process with moderation
+                            moderationService.moderateMessage(ctx.message.text, ctx, agent)
+                              .then(result => {
+                                console.log(`Moderation result: ${JSON.stringify(result)}`);
+                              })
+                              .catch(error => {
+                                console.error('Error in moderation:', error);
+                              });
+                          })
+                          .catch(error => {
+                            console.error('Error checking user status:', error);
+                          });
+                      }
+                    }
+                  });
+
+                  // Add handler for channel posts
+                  bot.on('channel_post', async (ctx) => {
+                    console.log('*** CHANNEL POST RECEIVED ***');
+                    console.log(`Channel ID: ${ctx.chat.id}, Channel title: ${ctx.chat.title || 'Unnamed channel'}`);
+                    console.log('Ignoring channel post as bot is not needed for channels');
+                    // No processing for channel posts
+                  });
+
+                  // Add handler for edited channel posts
+                  bot.on('edited_channel_post', async (ctx) => {
+                    console.log('*** EDITED CHANNEL POST RECEIVED ***');
+                    console.log(`Channel ID: ${ctx.chat.id}, Channel title: ${ctx.chat.title || 'Unnamed channel'}`);
+                    console.log('Ignoring edited channel post as bot is not needed for channels');
+                    // No processing for edited channel posts
+                  });
+
+                  // Handle forwarded messages in channels and groups
+                  bot.on('message', (ctx) => {
+                    if (ctx.message?.forward_from || ctx.message?.forward_from_chat) {
+                      console.log('*** FORWARDED MESSAGE RECEIVED ***');
+                      const chatType = ctx.chat.type;
+                      const isChannelOrGroup = chatType === 'channel' || chatType === 'group' || chatType === 'supergroup';
+
+                      if (isChannelOrGroup) {
+                        console.log(`Forwarded message in ${chatType} chat: ${ctx.chat.id}`);
+
+                        // Skip processing for channels
+                        if (chatType === 'channel') {
+                          console.log('Ignoring forwarded message in channel as bot is not needed for channels');
+                          return;
+                        }
+
+                        // First check if the forwarder is an admin for groups and supergroups
+                        const checkAdminAndProcess = async () => {
+                          // For groups and supergroups, check admin status
+                          let isAdmin = false;
+                          if (ctx.from) {
+                            try {
+                              const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                              isAdmin = ['creator', 'administrator'].includes(member.status);
+                              console.log(`Forwarded message sender admin status: ${isAdmin ? 'Admin' : 'Not admin'}`);
+                            } catch (error) {
+                              console.error('Error checking forwarded message sender admin status:', error);
+                              // Assume not an admin if we can't verify
+                              isAdmin = false;
+                            }
+                          }
+
+                          // We don't process forwarded messages automatically, only if they mention the bot
+                          if (ctx.message.caption && ctx.message.caption.includes(`@${ctx.botInfo.username}`)) {
+                            console.log(`Processing forwarded message with caption mentioning the bot`);
+                            // Process the caption as the message
+                            const messageText = ctx.message.caption.replace(`@${ctx.botInfo.username}`, '').trim();
+
+                            // If it's an admin, always process without moderation
+                            if (isAdmin) {
+                              console.log(`Forwarded message is from an admin, processing without moderation`);
+                            }
+
+                            messageController.processMessage(messageText, ctx, agent).catch(error => {
+                              console.error('Error processing forwarded message:', error);
+                            });
+                          }
+                        };
+
+                        // Execute the check and processing
+                        checkAdminAndProcess().catch(error => {
+                          console.error('Error in forwarded message admin check and processing:', error);
+                        });
+                      }
+                    }
+                  });
+
+                  // Add handler for channel post comments
+                  bot.on('channel_post_comment', async (ctx) => {
+                    console.log('*** CHANNEL COMMENT RECEIVED ***');
+                    console.log(`Channel ID: ${ctx.chat.id}, From: ${ctx.from?.username || ctx.from?.id || 'unknown'}`);
+                    console.log('Ignoring channel comment as bot is not needed for channels');
+                    // No processing for channel post comments
+                  });
+
+                  // Add moderation-specific commands
+                  bot.command('modstatus', async (ctx) => {
+                    console.log(`Moderation status command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                    // Only chat administrators can use this command
+                    try {
+                      const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                      const isAdmin = ['creator', 'administrator'].includes(member.status);
+
+                      if (!isAdmin) {
+                        return ctx.reply('Only administrators can use this command.');
+                      }
+
+                      // Get bot permissions
+                      const botMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
+                      const permissions = {
+                        canRestrictMembers: botMember.can_restrict_members,
+                        canDeleteMessages: botMember.can_delete_messages,
+                        canPinMessages: botMember.can_pin_messages
+                      };
+
+                      const statusMessage = `🤖 *Moderation Status*\n\n` +
+                        `*Bot Permissions*:\n` +
+                        `- Restrict Members: ${permissions.canRestrictMembers ? '✅' : '❌'}\n` +
+                        `- Delete Messages: ${permissions.canDeleteMessages ? '✅' : '❌'}\n` +
+                        `- Pin Messages: ${permissions.canPinMessages ? '✅' : '❌'}\n\n` +
+                        `*Moderation is ${agent.summary.telegram?.moderation ? 'enabled' : 'disabled'}*\n\n` +
+                        `*Warning Thresholds*:\n` +
+                        `- ${warningService.WARNING_THRESHOLDS.TEMP_MUTE} warnings: 1 hour mute\n` +
+                        `- ${warningService.WARNING_THRESHOLDS.KICK} warnings: Removal from group\n` +
+                        `- ${warningService.WARNING_THRESHOLDS.BAN} warnings: Permanent ban\n\n` +
+                        `Use /modon to enable moderation or /modoff to disable it.\n` +
+                        `Use /warnings to check warnings for users.`;
+
+                      ctx.replyWithMarkdown(statusMessage);
+                    } catch (error) {
+                      console.error('Error checking moderation status:', error);
+                      ctx.reply('⚠️ An error occurred while checking moderation status.');
+                    }
+                  });
+
+                  // Add a command to check warnings
+                  bot.command('warnings', async (ctx) => {
+                    console.log(`Warnings command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+
+                    // Get parameters
+                    const args = ctx.message.text.split(' ');
+
+                    try {
+                      // Check if user is an admin
+                      const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                      const isAdmin = ['creator', 'administrator'].includes(member.status);
+
+                      if (!isAdmin) {
+                        return ctx.reply('Only administrators can use this command.');
+                      }
+
+                      // If no user specified, show help
+                      if (args.length < 2) {
+                        return ctx.reply('Usage: /warnings <user_id_or_username> - Check warnings for a user\nExample: /warnings @username');
+                      }
+
+                      // Get target user
+                      let targetUser = args[1];
+                      let targetUserId = null;
+
+                      // Check if it's a username or reply
+                      if (targetUser.startsWith('@')) {
+                        // Handle username
+                        const username = targetUser.substring(1);
+
+                        // Try to find user in the chat
+                        try {
+                          // This is a limitation - we need the actual user ID, but Telegram doesn't provide
+                          // a direct way to get user ID from username. We'll ask for user ID instead.
+                          return ctx.reply(`Please use user ID instead of username for now.\nTo get the user ID, you can use a bot like @userinfobot.`);
+                        } catch (error) {
+                          console.error('Error finding user by username:', error);
+                          return ctx.reply(`Could not find user with username ${targetUser} in this chat.`);
+                        }
+                      } else if (ctx.message.reply_to_message) {
+                        // If replying to a message, use that user
+                        targetUserId = ctx.message.reply_to_message.from.id.toString();
+                      } else {
+                        // Assume it's a user ID
+                        targetUserId = targetUser;
+                      }
+
+                      // Get warnings for the user
+                      const warningInfo = await warningService.getWarningInfo(targetUserId, ctx.chat.id.toString());
+
+                      if (!warningInfo || warningInfo.warningCount === 0) {
+                        return ctx.reply(`No warnings found for this user.`);
+                      }
+
+                      // Format warning information
+                      let warningMessage = `*Warning Information*\n\n`;
+                      warningMessage += `User ID: \`${targetUserId}\`\n`;
+                      warningMessage += `Warnings: ${warningInfo.warningCount}\n`;
+                      warningMessage += `Last warning: ${warningInfo.lastWarning ? new Date(warningInfo.lastWarning).toLocaleString() : 'None'}\n`;
+                      warningMessage += `Warnings in the last 24 hours: ${warningInfo.warningsInLast24Hours.length}\n`;
+
+                      ctx.reply(warningMessage);
+                    } catch (error) {
+                      console.error('Error checking warnings:', error);
+                      ctx.reply('⚠️ An error occurred while checking warnings.');
+                    }
+                  });
+
+                  // Add a cancel command to abort API key setup
+                  bot.command('cancel', async (ctx) => {
+                    if (ctx.session?.waitingForApiKey) {
+                      ctx.session.waitingForApiKey = false;
+                      await ctx.reply('API key setup cancelled.');
+
+                      // Return to main menu
+                      const welcomeMessage = `👋 Welcome back to ${agent.name}!\n\nPlease select an option:`;
+                      const keyboard = {
+                        inline_keyboard: [
+                          [
+                            {
+                              text: '🔑 Enter Fullmetal API Key',
+                              callback_data: 'setup_apikey'
+                            }
+                          ],
+                          [
+                            {
+                              text: '➕ Add to Group',
+                              url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
+                            }
+                          ],
+                          [
+                            {
+                              text: '👮‍♂️ Give Admin Access',
+                              callback_data: 'setup_admin'
+                            }
+                          ],
+                          [
+                            {
+                              text: '📚 Help & Commands',
+                              callback_data: 'show_help'
+                            }
+                          ]
+                        ]
+                      };
+
+                      await ctx.reply(welcomeMessage, {
+                        reply_markup: keyboard,
+                        parse_mode: 'Markdown'
+                      });
+                    }
+                  });
+
+                  // Start the bot
+                  console.log('Launching bot...');
+                  try {
+                    bot.launch();
+                    console.log('Bot launched successfully for agent:', agent.name);
+
+                    // Add token to active tokens set to prevent duplicates
+                    activeTokens.add(botToken);
+
+                    // Store the bot in our active bots map
+                    activeBots.set(agentId, {
+                      bot: bot,
+                      updatedAt: currentUpdatedAt,
+                      name: agent.name
+                    });
+
+                    // Enable graceful stop for this specific bot
+                    process.once('SIGINT', () => {
+                      console.log('SIGINT received, stopping bot');
+                      activeTokens.delete(botToken);
+                      bot.stop('SIGINT');
+                    });
+                    process.once('SIGTERM', () => {
+                      console.log('SIGTERM received, stopping bot');
+                      activeTokens.delete(botToken);
+                      bot.stop('SIGTERM');
+                    });
+                  } catch (launchError) {
+                    console.error('Error starting bot:', launchError);
+                    // Clean up if launch fails
+                    activeTokens.delete(botToken);
+                  }
+                } catch (setupError) {
+                  console.error(`Error creating bot for agent ${agent.name}:`, setupError);
+                }
+              } else {
+                console.log(`  Warning: No valid API key found for this agent`);
+              }
+            } else {
+              console.log(`Bot for agent ${agent.name} is already running and up to date.`);
+            }
+          } catch (agentError) {
+            console.error(`Error processing agent ${agent.name}:`, agentError);
+          }
+        }
+
+        // Check for bots that need to be stopped (agents no longer in the database)
+        try {
+          const currentAgentIds = new Set(agents.map(agent => agent._id.toString()));
+          for (const [agentId, botInfo] of activeBots.entries()) {
+            if (!currentAgentIds.has(agentId)) {
+              console.log(`Agent ${botInfo.name} no longer exists, stopping bot...`);
+              try {
+                await botInfo.bot.stop('REMOVED');
+                // Find and remove the token from activeTokens
+                let tokenToRemove = null;
+                for (const agent of agents) {
+                  if (agent._id.toString() === agentId) {
+                    tokenToRemove = agent.summary.telegram.token;
+                    break;
+                  }
+                }
+                if (tokenToRemove) {
+                  activeTokens.delete(tokenToRemove);
+                  console.log(`Removed token for deleted agent ${botInfo.name}`);
+                }
+                activeBots.delete(agentId);
+                console.log(`Successfully stopped and removed bot for deleted agent ${botInfo.name}`);
+              } catch (error) {
+                console.error(`Error stopping bot for deleted agent ${botInfo.name}:`, error);
+              }
+            }
+          }
+        } catch (cleanupError) {
+          console.error('Error cleaning up unused bots:', cleanupError);
+        }
+      } else {
+        console.log('No agents found with Telegram tokens');
+      }
+    } catch (error) {
+      console.error('Error initializing agent data:', error);
+    }
+  }
+}
+
+// Initialize agent data
+initializeAgentData();
+
+// Do not initialize a separate bot instance since bots are already being created in the initializeAgentData function
+// const bot = new Telegraf(process.env.TELEGRAM_TOKEN...); // Removed duplicate bot initialization

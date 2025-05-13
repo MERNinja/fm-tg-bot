@@ -27,6 +27,10 @@ const userSchema = new Schema(
         phoneNumber: {
             type: String,
         },
+        telegramUserId: {
+            type: String,
+            index: true, // Add index for faster lookups
+        },
         social: {
             type: Boolean,
             default: false,

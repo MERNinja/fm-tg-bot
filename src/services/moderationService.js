@@ -10,6 +10,7 @@
 const fullmetalService = require('./fullmetalService');
 const memoryService = require('./memoryService');
 const warningService = require('./warningService');
+const groupService = require('./groupService');
 const UserWarning = require('../models/UserWarning');
 
 class ModerationService {
@@ -23,21 +24,61 @@ class ModerationService {
      */
     async moderateMessage(message, ctx, agent, takeAction = true) {
         try {
+            // Skip all channel operations as the bot isn't needed for channels
+            if (ctx.chat.type === 'channel') {
+                console.log(`[ModerationService] Message is from a channel, skipping as bot is not needed for channels`);
+                return {
+                    actionRequired: false,
+                    reason: 'Bot not needed for channels',
+                    action: 'none',
+                    actionTaken: false
+                };
+            }
+
+            // Get group info from database (if exists)
+            const telegramGroupId = ctx.chat.id.toString();
+            let group = null;
+
+            // Find or create group in the database
+            try {
+                group = await groupService.getGroupByTelegramId(telegramGroupId);
+
+                // If the group exists but moderation is disabled, skip moderation
+                if (group && !group.moderationEnabled) {
+                    console.log(`[ModerationService] Moderation is disabled for group ${telegramGroupId}, skipping`);
+                    return {
+                        actionRequired: false,
+                        reason: 'Moderation disabled for this group',
+                        action: 'none',
+                        actionTaken: false
+                    };
+                }
+
+                // If we don't have group info, create a basic record
+                if (!group && ctx.chat.type !== 'private') {
+                    console.log(`[ModerationService] Creating new group record for ${telegramGroupId}`);
+                    const groupData = {
+                        telegramGroupId: telegramGroupId,
+                        groupName: ctx.chat.title || 'Unnamed Group',
+                        groupType: ctx.chat.type,
+                        agentId: agent._id,
+                        apiKeyUserId: agent.userId?._id,
+                        memberCount: 0,
+                        moderationEnabled: true
+                    };
+
+                    // Save group data
+                    group = await groupService.saveGroup(groupData);
+                }
+            } catch (error) {
+                console.error(`[ModerationService] Error getting/creating group ${telegramGroupId}:`, error);
+                // Continue with moderation using agent-level settings
+            }
+
             // First check if the user is an admin - if so, skip moderation actions
             let isAdmin = false;
             try {
                 if (ctx.from && ctx.chat) {
-                    // Skip all channel operations as the bot isn't needed for channels
-                    if (ctx.chat.type === 'channel') {
-                        console.log(`[ModerationService] Message is from a channel, skipping as bot is not needed for channels`);
-                        return {
-                            actionRequired: false,
-                            reason: 'Bot not needed for channels',
-                            action: 'none',
-                            actionTaken: false
-                        };
-                    }
-
                     // For groups and supergroups, check admin status
                     if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
                         const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
@@ -60,11 +101,58 @@ class ModerationService {
                 // Continue with moderation if we can't verify admin status
             }
 
+            // Update API usage for the group
+            if (group) {
+                await groupService.updateApiUsage(telegramGroupId, 'moderation');
+            }
+
             const messageWithContext = this.#buildModerationPrompt(message, ctx);
             console.log(`[ModerationService] Analyzing message for moderation`);
 
+            // Get API key from various sources (priority order):
+            // 1. User-specific API key (if available)
+            // 2. Group-specific API key (if available)
+            // 3. Agent API key (fallback)
+            let apiKey = null;
+            const telegramUserId = ctx.from.id.toString();
+
+            // Try to get Telegram user's API key first
+            try {
+                const User = require('../models/User');
+                const userWithApiKey = await User.findOne({ telegramUserId });
+
+                if (userWithApiKey && userWithApiKey.apiKey && userWithApiKey.apiKey.length > 0) {
+                    apiKey = userWithApiKey.apiKey[0];
+                    console.log(`[ModerationService] Using Telegram user-specific API key for user ${telegramUserId}`);
+                }
+            } catch (error) {
+                console.error(`[ModerationService] Error getting user-specific API key for ${telegramUserId}:`, error);
+            }
+
+            // If no user-specific key, try group key
+            if (!apiKey && group && group.apiKeyUserId && group.apiKeyUserId.apiKey && group.apiKeyUserId.apiKey.length > 0) {
+                apiKey = group.apiKeyUserId.apiKey[0];
+                console.log(`[ModerationService] Using group-specific API key for ${telegramGroupId}`);
+            }
+            // If no group key, try agent key
+            else if (!apiKey && agent.userId && agent.userId.apiKey && agent.userId.apiKey.length > 0) {
+                apiKey = agent.userId.apiKey[0];
+                console.log(`[ModerationService] Using agent's API key (no user or group-specific key available)`);
+            }
+
+            // If no key available at all
+            if (!apiKey) {
+                console.log(`[ModerationService] No API key available for moderation`);
+                return {
+                    actionRequired: false,
+                    reason: 'No API key available',
+                    action: 'none',
+                    actionTaken: false
+                };
+            }
+
             // Get a response from the Fullmetal agent
-            const { response } = await fullmetalService.getStreamingResponse(messageWithContext, agent);
+            const { response } = await fullmetalService.getStreamingResponse(messageWithContext, agent, apiKey);
 
             let responseData = '';
             let buffer = '';
@@ -114,11 +202,12 @@ class ModerationService {
 
                     // Parse moderation decision
                     const moderationResult = this.#parseModerationResponse(responseData);
+                    moderationResult.groupId = telegramGroupId;
 
                     // Take action if requested
                     if (takeAction && moderationResult.actionRequired) {
                         try {
-                            await this.#takeModeratorAction(ctx, moderationResult);
+                            await this.#takeModeratorAction(ctx, moderationResult, group);
                             moderationResult.actionTaken = true;
                         } catch (actionError) {
                             console.error('[ModerationService] Error taking action:', actionError);
@@ -156,10 +245,18 @@ class ModerationService {
         const user = ctx.from;
         const chat = ctx.chat;
 
-        return `
+        return `MODERATION_ANALYSIS
 Group: ${chat.title || 'Unknown'}
 User: @${user.username || 'unknown'} (user_id: ${user.id})
-Message: ${message}`;
+Message: ${message}
+
+Analyze this message for community guidelines violations. 
+
+IMPORTANT: Respond ONLY with one of these JSON templates, and nothing else - no explanations or repetition of the prompt:
+
+{"action": "ignore", "reason": "Message appears safe"} 
+{"action": "warn", "user_id": ${user.id}, "reason": "Specific reason for warning"}
+{"action": "ban", "user_id": ${user.id}, "reason": "Specific reason for ban"}`;
     }
 
     /**
@@ -171,13 +268,28 @@ Message: ${message}`;
     #parseModerationResponse(response) {
         try {
             // Extract JSON object if response contains other text
-            // const jsonMatch = response.match(/{[\s\S]*}/);
-            // const jsonStr = jsonMatch ? jsonMatch[0] : response;
+            console.log('[ModerationService] Raw response:', response);
 
-            // Parse the JSON
-            console.log('[ModerationService] Parsing response:', response);
-            const decision = JSON.parse(response);
+            // Try to find a complete JSON object in the response
+            const jsonMatch = response.match(/\{[\s\S]*?\}/);
+            if (!jsonMatch) {
+                console.error('[ModerationService] No JSON object found in response');
+                return {
+                    actionRequired: false,
+                    reason: 'No JSON object found in response',
+                    action: 'none',
+                    userId: null,
+                    violationType: 'unknown',
+                    rawResponse: response,
+                    parseError: true
+                };
+            }
 
+            const jsonStr = jsonMatch[0];
+            console.log('[ModerationService] Extracted JSON:', jsonStr);
+
+            // Parse the extracted JSON
+            const decision = JSON.parse(jsonStr);
             console.log('[ModerationService] Parsed decision:', decision);
 
             // Map the action field to our internal actions
@@ -206,7 +318,7 @@ Message: ${message}`;
             };
         } catch (error) {
             console.error('[ModerationService] Error parsing moderation response:', error);
-            console.log('Raw response:', response);
+            console.log('[ModerationService] Problematic response:', response);
 
             // Return default values if parsing fails
             return {
@@ -226,9 +338,10 @@ Message: ${message}`;
      * @private
      * @param {Object} ctx - Telegram context
      * @param {Object} decision - Moderation decision
+     * @param {Object} group - Group information
      * @returns {Promise<Object>} Result of the action
      */
-    async #takeModeratorAction(ctx, decision) {
+    async #takeModeratorAction(ctx, decision, group) {
         const userId = ctx.from.id;
         const chatId = ctx.chat.id;
         const messageId = ctx.message.message_id;
@@ -281,6 +394,12 @@ Message: ${message}`;
                     const warningResult = await warningService.addWarning(ctx, decision.reason, {
                         _id: ctx.botInfo?.id?.toString() || 'unknown'
                     });
+
+                    // Check if this was a previously banned user who got warnings reset
+                    if (warningResult.action === 'warnings_reset') {
+                        console.log(`[ModerationService] Previously banned user ${userId} had warnings reset`);
+                        // Continue with processing the warning since we want to count this current violation
+                    }
 
                     // Get the warning count
                     const warningCount = warningResult.warningCount || 1;

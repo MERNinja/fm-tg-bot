@@ -53,6 +53,29 @@ class WarningService {
                 telegramChatId: chatId
             });
 
+            // If user already has a warning record, check if they were previously banned
+            if (warningRecord && warningRecord.isBanned) {
+                console.log(`[WarningService] User ${userId} was previously banned in this group`);
+
+                try {
+                    // Reset warning count and ban status for re-added user
+                    warningRecord.warningCount = 0;
+                    warningRecord.warnings = [];
+                    warningRecord.isBanned = false;
+                    warningRecord.banDate = null;
+                    warningRecord.banReason = null;
+                    await warningRecord.save();
+
+                    // Notify the chat
+                    await ctx.reply(`⚠️ Warning history has been reset for a previously banned user who has been re-added to the group.`);
+
+                    // Continue with adding the new warning after reset
+                    console.log(`[WarningService] Warning history reset, now adding new warning`);
+                } catch (error) {
+                    console.error('[WarningService] Error resetting warnings for previously banned user:', error);
+                }
+            }
+
             // Remove expired warnings first (if record exists)
             if (warningRecord) {
                 await this.cleanupExpiredWarnings(warningRecord);
@@ -120,8 +143,19 @@ class WarningService {
         if (validWarnings.length < warningRecord.warnings.length) {
             console.log(`[WarningService] Removing ${warningRecord.warnings.length - validWarnings.length} expired warnings`);
             warningRecord.warnings = validWarnings;
+            // Ensure warning count matches the actual number of valid warnings
             warningRecord.warningCount = validWarnings.length;
+
+            // Check if user is currently banned but all ban-causing warnings have expired
+            if (warningRecord.isBanned && warningRecord.warningCount < WARNING_THRESHOLDS.BAN) {
+                console.log(`[WarningService] User's ban status reset due to expired warnings`);
+                warningRecord.isBanned = false;
+                warningRecord.banReason = null;
+                warningRecord.banDate = null;
+            }
+
             await warningRecord.save();
+            console.log(`[WarningService] Updated warning count to ${warningRecord.warningCount} after cleanup`);
         }
     }
 
@@ -137,13 +171,47 @@ class WarningService {
             const userId = warningRecord.telegramUserId;
             const chatId = warningRecord.telegramChatId;
 
-            // If already banned, do nothing
+            // If already banned, check if they've been re-added and reset their warnings
             if (warningRecord.isBanned) {
-                console.log(`[WarningService] User ${userId} is already banned`);
+                console.log(`[WarningService] User ${userId} was previously banned, checking if they were re-added`);
+
+                try {
+                    // Check if the user is currently in the group
+                    const chatMember = await ctx.telegram.getChatMember(chatId, userId);
+
+                    // If user exists and is a member (not banned), reset their warnings
+                    if (chatMember && ['member', 'administrator', 'creator'].includes(chatMember.status)) {
+                        console.log(`[WarningService] Previously banned user ${userId} was re-added to group, resetting warnings`);
+
+                        // Reset warning count and ban status
+                        warningRecord.warningCount = 0;
+                        warningRecord.warnings = [];
+                        warningRecord.isBanned = false;
+                        warningRecord.banDate = null;
+                        warningRecord.banReason = null;
+                        await warningRecord.save();
+
+                        // Notify the chat
+                        await ctx.reply(`⚠️ Warning history has been reset for a previously banned user who has been re-added to the group.`);
+
+                        return 'warnings_reset';
+                    }
+                } catch (error) {
+                    console.error('[WarningService] Error checking status of previously banned user:', error);
+                }
+
                 return 'already_banned';
             }
 
             console.log(`[WarningService] Checking thresholds for user ${userId} with ${warningCount} warnings`);
+
+            // Double-check that warning count matches actual warnings array length
+            if (warningCount !== warningRecord.warnings.length) {
+                console.log(`[WarningService] Warning count mismatch detected: count=${warningCount}, actual=${warningRecord.warnings.length}`);
+                warningRecord.warningCount = warningRecord.warnings.length;
+                await warningRecord.save();
+                console.log(`[WarningService] Fixed warning count to ${warningRecord.warningCount}`);
+            }
 
             // Check for ban threshold (5 warnings)
             if (warningCount >= WARNING_THRESHOLDS.BAN) {

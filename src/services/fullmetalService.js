@@ -113,35 +113,67 @@ class FullmetalService {
   /**
    * Send a request to the Fullmetal AI API and return a streaming response
    * @param {string} userMessage - The user's message
-   * @param {string} agentId - The agent ID to use
+   * @param {Object} agent - The agent object to use
+   * @param {string} [apiKey] - Optional specific API key to use (for group-specific billing)
    * @returns {Promise<{response: Response, agent: Object}>} - The streaming response from the API and agent object
    */
-  async getStreamingResponse(userMessage, agent) {
-    // const { fullPrompt, agentId: targetAgentId } = await this.preparePrompt(userMessage, agent);
+  async getStreamingResponse(userMessage, agent, apiKey = null) {
+    // Use provided API key or fallback to agent's user API key
+    const useApiKey = apiKey || (agent.userId && agent.userId.apiKey && agent.userId.apiKey.length > 0 ? agent.userId.apiKey[0] : null);
+
+    if (!useApiKey) {
+      console.error(`[FullmetalService] No API key available for agent ${agent.name}`);
+      throw new Error('No API key available');
+    }
+
+    // Add instruction to respond in natural language, not JSON
+    let systemPrompt = agent.summary.system || "";
+
+    // Customize system prompt based on message type
+    if (userMessage.includes("MODERATION_ANALYSIS")) {
+      // Special system prompt for moderation requests
+      systemPrompt = `${systemPrompt}\n\nYou are a content moderation assistant. For moderation requests:
+1. Analyze the content objectively according to community guidelines
+2. Respond ONLY with the requested JSON format, nothing else
+3. Do not include any explanations or repeat the original prompt
+4. If uncertain, use the "ignore" action unless there's clear evidence of a violation`;
+
+      console.log(`[FullmetalService] Handling moderation request with specific system instructions`);
+    } else {
+      // Normal conversation, add natural language instructions
+      systemPrompt += "\n\nPlease respond in natural language, not JSON format. Provide a conversational response as you would in a normal chat.";
+    }
+
     const bodyData = {
       prompt: userMessage,
       agentId: agent._id,
       stream: true,
-      systemPrompt: agent.summary.system ?
-        `${agent.summary.system}\n\nPlease consider the User's current message for your response.` :
+      systemPrompt: systemPrompt ?
+        `${systemPrompt}\n\nPlease consider the User's current message for your response.` :
         "Please consider the User's current message for your response."
     }
-    console.log(`Processing message: `, bodyData);
-    const response = await fetch(this.API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': agent.userId.apiKey[0]
-      },
-      body: JSON.stringify(bodyData)
-    });
+    console.log(`[FullmetalService] Processing message with${apiKey !== null ? ' group-specific' : ' agent\'s'} API key`);
 
-    if (!response.ok) {
-      // throw new Error(`API error: ${response.status}`);
+    try {
+      const response = await fetch(this.API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': useApiKey
+        },
+        body: JSON.stringify(bodyData)
+      });
+
+      if (!response.ok) {
+        console.error(`[FullmetalService] API error: ${response.status}`);
+      }
+
+      // Return both the response and the agent for tracking purposes
+      return { response, agent };
+    } catch (error) {
+      console.error(`[FullmetalService] Error calling Fullmetal API:`, error);
+      throw error;
     }
-
-    // Return both the response and the agent for tracking purposes
-    return { response, agent };
   }
 
   /**

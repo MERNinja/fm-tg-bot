@@ -19,11 +19,14 @@ class MessageController {
     
     try {
       console.log(`[Controller] Processing message from user: ${ctx.from?.id || 'unknown'}, text: "${userMessage.substring(0, 50)}${userMessage.length > 50 ? '...' : ''}"`);
+      console.log(`[DEBUG-CONTROLLER] Starting message processing pipeline`);
 
       // Handle case where ctx.from might be missing (like in some channel posts)
       const telegramUserId = (ctx.from?.id || ctx.chat?.id || 'unknown').toString();
       const telegramChatId = ctx.chat?.id?.toString() || telegramUserId;
       const agentId = agent._id.toString();
+
+      console.log(`[DEBUG-CONTROLLER] User ID: ${telegramUserId}, Chat ID: ${telegramChatId}, Agent ID: ${agentId}`);
 
       // Check if this is a potential duplicate message
       // Use a cache with unique request IDs to prevent duplicate processing
@@ -79,7 +82,9 @@ class MessageController {
         });
 
         // Race the API promise against the timeout
+        console.log(`[DEBUG-CONTROLLER] Sending request to API with timeout of ${API_TIMEOUT / 1000} seconds`);
         const { response } = await Promise.race([apiPromise, timeoutPromise]);
+        console.log(`[DEBUG-CONTROLLER] Received response from API, starting processing`);
 
         let responseText = '';
         let buffer = '';
@@ -139,20 +144,46 @@ class MessageController {
               }
             }
 
+            // Check if the response is a JSON object and format it for normal reading
+            let finalResponseText = responseText;
+            try {
+              // Check if the response appears to be JSON
+              if (responseText.trim().startsWith('{') && responseText.trim().endsWith('}')) {
+                const jsonObj = JSON.parse(responseText);
+                // If it's JSON, convert it to a readable message
+                if (jsonObj.action) {
+
+                  // This appears to be a moderation response, convert to normal text
+                  if (jsonObj.action === 'ignore') {
+                    finalResponseText = jsonObj.reason || "I don't see any issues with that message.";
+                  } else {
+                    finalResponseText = "I've processed your message.";
+                  }
+                } else if (Object.keys(jsonObj).length > 0) {
+                  // Generic JSON object, respond naturally
+                  finalResponseText = `I received your message. Here's what I understand: ${responseText}`;
+                }
+                console.log('[Controller] Detected and formatted JSON response');
+              }
+            } catch (jsonError) {
+              // Not JSON or invalid JSON, use the original response
+              console.log('[Controller] Response is not JSON or could not be parsed');
+            }
+
             // Final update to the message
             try {
               await ctx.telegram.editMessageText(
                 ctx.chat.id,
                 messageId,
                 undefined, 
-                responseText || 'Please try again.'
+                finalResponseText || 'Please try again.'
               );
             } catch (error) {
               console.error('[Controller] Error updating final message:', error);
               // If editing fails, try sending a new message
               try {
                 await ctx.reply('⚠️ Error updating message. Full response:');
-                await ctx.reply(responseText || 'Please try again.');
+                await ctx.reply(finalResponseText || 'Please try again.');
               } catch (secondError) {
                 console.error('[Controller] Error sending fallback message:', secondError);
               }
@@ -169,7 +200,7 @@ class MessageController {
             }
 
             console.log(`[Controller] Completed processing message from user: ${telegramUserId}, response length: ${responseText.length}`);
-            resolve(responseText || 'Please try again.');
+            resolve(finalResponseText || 'Please try again.');
           });
 
           response.body.on('error', err => {
