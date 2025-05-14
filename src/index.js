@@ -22,6 +22,10 @@ const activeBots = new Map();
 // Track bot tokens to prevent duplicates
 const activeTokens = new Set();
 
+// Store user states and pending group instructions
+global.userStates = global.userStates || new Map();
+global.pendingGroupInstructions = new Map();
+
 // Add heartbeat mechanism
 function setupHeartbeat() {
   if (process.env.NODE_HEARTBEAT_FILE && process.env.NODE_HEARTBEAT_INTERVAL) {
@@ -45,6 +49,48 @@ function setupHeartbeat() {
         fs.writeFileSync(heartbeatFile, Date.now().toString());
       } catch (error) { /* ignore */ }
     });
+  }
+}
+
+// Utility function to safely call answerCbQuery
+function safeAnswerCbQuery(ctx, text = '') {
+  // Only call answerCbQuery if it's available in this context
+  if (ctx.callbackQuery && typeof ctx.answerCbQuery === 'function') {
+    return ctx.answerCbQuery(text);
+  }
+  // Return a resolved promise for consistent behavior
+  return Promise.resolve();
+}
+
+// Utility function for safely editing messages
+async function safeEditMessageText(ctx, text, options = {}) {
+  try {
+    if (ctx.callbackQuery) {
+      // If it's a callback query, edit the message
+      return await ctx.editMessageText(text, options);
+    } else {
+      // If not, send a new message
+      return await ctx.reply(text, options);
+    }
+  } catch (error) {
+    console.log(`[Safe Edit] Error editing message: ${error.message}`);
+    // If editing fails, try alternative methods to send a message
+    try {
+      if (ctx.telegram && ctx.chat && ctx.chat.id) {
+        // Use the telegram instance directly if available
+        return await ctx.telegram.sendMessage(ctx.chat.id, text, options);
+      } else if (ctx.telegram && ctx.from && ctx.from.id) {
+        // If chat is not available but user is, send to user
+        return await ctx.telegram.sendMessage(ctx.from.id, text, options);
+      } else if (typeof ctx.reply === 'function') {
+        // If ctx.reply is available, use it
+        return await ctx.reply(text, options);
+      } else {
+        console.log(`[Safe Edit] Cannot send message - no valid methods available`);
+      }
+    } catch (fallbackError) {
+      console.log(`[Safe Edit] Fallback error: ${fallbackError.message}`);
+    }
   }
 }
 
@@ -178,6 +224,9 @@ async function initializeAgentData() {
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 console.log('Wait complete, continuing bot initialization...');
 
+                // Track if handlers have been registered to prevent duplicates
+                let handlersRegistered = false;
+
                 // Function to generate the main menu based on API key validation status
                 async function generateMainMenu(ctx, agent, isFirstTime = false) {
                   // Get user ID
@@ -234,8 +283,8 @@ async function initializeAgentData() {
                     keyboard.inline_keyboard = [
                       [
                         {
-                          text: '➕ Add to Group',
-                          url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
+                          text: '🚀 Get Started (Add to Group)',
+                          callback_data: 'get_started'
                         }
                       ],
                       [
@@ -400,433 +449,711 @@ async function initializeAgentData() {
                   }
                 });
 
-                // Handle callback queries from inline buttons
-                bot.on('callback_query', async (ctx) => {
-                  console.log(`[Callback] Received: ${ctx.callbackQuery.data} from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+                // Function to handle the Get Started flow
+                async function handleGetStarted(ctx) {
+                  console.log(`[Get Started] Processing Get Started request for user ${ctx.from.id}`);
+                  await ctx.answerCbQuery('Starting setup process...');
 
-                  const callbackData = ctx.callbackQuery.data;
+                  // Check if user has an API key
+                  const userId = ctx.from.id.toString();
+                  const userWithApiKey = await checkUserApiKey(userId);
+                  const hasUserApiKey = userWithApiKey && userWithApiKey.apiKey && userWithApiKey.apiKey.length > 0;
 
-                  // Process different callback actions
-                  switch (callbackData) {
-                    case 'setup_apikey':
-                      console.log(`[Callback] User ${ctx.from.id} requested API key setup`);
-                      await handleApiKeySetup(ctx);
-                      break;
+                  if (!hasUserApiKey) {
+                    console.log(`[Get Started] User ${userId} doesn't have API key, redirecting to setup`);
+                    await ctx.reply('You need to set up your API key first before adding the bot to groups.');
+                    await handleApiKeySetup(ctx);
+                    return;
+                  }
 
-                    case 'remove_apikey':
-                      console.log(`[Callback] User ${ctx.from.id} requested API key removal`);
-                      await handleApiKeyRemoval(ctx);
-                      break;
+                  // First check if user already has groups
+                  try {
+                    // Get groups for this agent
+                    const groups = await groupService.getGroupsByAgentId(agent._id);
 
-                    case 'confirm_remove_apikey':
-                      console.log(`[Callback] User ${ctx.from.id} confirmed API key removal`);
-                      await handleConfirmApiKeyRemoval(ctx);
-                      break;
+                    // Also check if there are any groups specifically added by this user
+                    let userGroups = [];
+                    if (userWithApiKey && userWithApiKey._id) {
+                      userGroups = await groupService.getGroupsByAddedByUserId(userWithApiKey._id);
+                    }
 
-                    case 'setup_admin':
-                      console.log(`[Callback] User ${ctx.from.id} requested admin setup`);
-                      await handleAdminSetup(ctx);
-                      break;
-
-                    case 'show_help':
-                      console.log(`[Callback] User ${ctx.from.id} requested help information`);
-                      await handleShowHelp(ctx);
-                      break;
-
-                    case 'back_to_main':
-                      console.log(`[Callback] User ${ctx.from.id} returning to main menu`);
-                      await ctx.answerCbQuery('Returning to main menu...');
-
-                      // Get menu options
-                      const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
-
-                      // Edit the current message instead of sending a new one
-                      await ctx.editMessageText(welcomeMessage, {
-                        reply_markup: keyboard,
-                        parse_mode: 'Markdown'
-                      });
-                      console.log(`[Callback] Displayed main menu to user ${ctx.from.id}`);
-                      break;
-
-                    case 'list_groups':
-                      console.log(`[Callback] User ${ctx.from.id} requested group listing`);
-                      await ctx.answerCbQuery('Fetching your groups...');
-
-                      try {
-                        const userId = ctx.from.id.toString();
-                        // Find user in database if exists
-                        let dbUser = null;
-                        let mongoUserId = null;
-
-                        if (agent.userId && agent.userId._id) {
-                          // Default to agent's user
-                          mongoUserId = agent.userId._id;
+                    // Combine and filter unique groups
+                    const allGroups = [...groups];
+                    if (userGroups.length > 0) {
+                      // Add user groups that aren't already in the list
+                      for (const group of userGroups) {
+                        if (!allGroups.some(g => g.telegramGroupId === group.telegramGroupId)) {
+                          allGroups.push(group);
                         }
+                      }
+                    }
 
-                        // Get groups for this agent
-                        const groups = await groupService.getGroupsByAgentId(agent._id);
-
-                        if (groups.length === 0) {
-                          // No groups found
-                          const message =
-                            `You haven't added me to any groups yet.\n\n` +
-                            `To add me to a group:\n` +
-                            `1. Open your group\n` +
-                            `2. Tap on the group name at the top\n` +
-                            `3. Select "Add member"\n` +
-                            `4. Search for @${ctx.botInfo.username}\n` +
-                            `5. Tap "Add"\n\n` +
-                            `Alternatively, use this link:\n` +
-                            `https://t.me/${ctx.botInfo.username}?startgroup=true`;
-
-                          // Check if agent has a validated API key
-                          const hasValidApiKey = agent.userId && agent.userId._id && agent.userId.apiKey && agent.userId.apiKey.length > 0;
-
-                          const groupsKeyboard = {
+                    if (allGroups.length > 0) {
+                      // User has existing groups, show them as options
+                      await safeEditMessageText(ctx,
+                        `*Get Started: Manage Existing Groups*\n\n` +
+                        `You already have groups with this bot. Choose an option:\n\n` +
+                        `• Select an existing group to manage\n` +
+                        `• Add the bot to a new group`,
+                        {
+                          parse_mode: 'Markdown',
+                          reply_markup: {
                             inline_keyboard: [
-                              hasValidApiKey ?
-                                [{ text: '➕ Add to Group', url: `https://t.me/${ctx.botInfo.username}?startgroup=true` }] :
-                                [{ text: '🔑 Set Up API Key First', callback_data: 'setup_apikey' }],
-                              [{ text: '« Back', callback_data: 'back_to_main' }]
-                            ]
-                          };
-
-                          await ctx.editMessageText(message, { reply_markup: groupsKeyboard });
-                          console.log(`[Callback] Displayed empty group list to user ${ctx.from.id}`);
-                        } else {
-                          // Build group list message
-                          let message = `*Your Groups (${groups.length})*\n\n`;
-
-                          // Create inline keyboard with groups
-                          const groupButtons = [];
-
-                          for (const group of groups) {
-                            message += `• *${group.groupName}*\n`;
-                            message += `  - Type: ${group.groupType === 'supergroup' ? 'Supergroup' : 'Group'}\n`;
-                            message += `  - Moderation: ${group.moderationEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
-                            message += `  - API Key: ${group.apiKeyUserId ? '✅ Set' : '❌ Not set'}\n\n`;
-
-                            // Add button for this group
-                            groupButtons.push([
-                              {
+                              ...allGroups.map(group => [{
                                 text: group.groupName,
                                 callback_data: `group_${group.telegramGroupId}`
-                              }
-                            ]);
+                              }]),
+                              [{ text: '➕ Add to New Group', callback_data: 'add_to_new_group' }],
+                              [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                            ]
                           }
-
-                          // Add back button
-                          groupButtons.push([
-                            { text: '« Back to Main Menu', callback_data: 'back_to_main' }
-                          ]);
-
-                          const groupsKeyboard = {
-                            inline_keyboard: groupButtons
-                          };
-
-                          await ctx.editMessageText(message, {
-                            reply_markup: groupsKeyboard,
-                            parse_mode: 'Markdown'
-                          });
-                          console.log(`[Callback] Displayed group list to user ${ctx.from.id}`);
                         }
-                      } catch (error) {
-                        console.error(`[Callback] Error listing groups for user ${ctx.from.id}:`, error);
-                        await ctx.reply('Error fetching groups. Please try again later.');
-                      }
-                      break;
-
-                    default:
-                      if (callbackData.startsWith('group_')) {
-                        if (callbackData.startsWith('group_apikey_')) {
-                          // Handle setting API key for a specific group
-                          const groupId = callbackData.replace('group_apikey_', '');
-                          console.log(`[Callback] User ${ctx.from.id} setting API key for group ${groupId}`);
-                          await handleGroupApiKeySetup(ctx, groupId);
-                        } else if (callbackData.startsWith('group_mod_on_')) {
-                          // Enable moderation for a group
-                          const groupId = callbackData.replace('group_mod_on_', '');
-                          console.log(`[Callback] User ${ctx.from.id} enabling moderation for group ${groupId}`);
-                          await toggleGroupModeration(ctx, groupId, true);
-                        } else if (callbackData.startsWith('group_mod_off_')) {
-                          // Disable moderation for a group
-                          const groupId = callbackData.replace('group_mod_off_', '');
-                          console.log(`[Callback] User ${ctx.from.id} disabling moderation for group ${groupId}`);
-                          await toggleGroupModeration(ctx, groupId, false);
-                        } else if (callbackData.startsWith('group_remove_confirm_')) {
-                          // Confirmed bot removal from group
-                          const groupId = callbackData.replace('group_remove_confirm_', '');
-                          console.log(`[Callback] User ${ctx.from.id} confirmed removal of bot from group ${groupId}`);
-
-                          try {
-                            await ctx.answerCbQuery('Removing bot from group...');
-
-                            // Get group info
-                            const group = await groupService.getGroupByTelegramId(groupId);
-
-                            if (!group) {
-                              await ctx.reply('Error: Group not found');
-                              await ctx.editMessageText('Could not find group information. Please try again or contact support.',
-                                { reply_markup: { inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]] } });
-                              return;
-                            }
-
-                            // Leave the group
-                            try {
-                              await ctx.telegram.leaveChat(groupId);
-                              console.log(`[Group Removal] Successfully left group ${groupId}`);
-
-                              // Mark group as inactive in database
-                              await groupService.deactivateGroup(groupId);
-
-                              // Show success message
-                              await ctx.editMessageText(
-                                `✅ Successfully removed bot from *${group.groupName}*\n\n` +
-                                `The bot has left the group and all moderation features are now disabled.\n\n` +
-                                `You can add the bot back to the group at any time if needed.`,
-                                {
-                                  parse_mode: 'Markdown',
-                                  reply_markup: {
-                                    inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
-                                  }
-                                }
-                              );
-                            } catch (leaveError) {
-                              console.error(`[Group Removal] Error leaving group ${groupId}:`, leaveError);
-
-                              // Handle case where bot might not be in the group anymore
-                              if (leaveError.description &&
-                                (leaveError.description.includes('bot is not a member') ||
-                                  leaveError.description.includes('chat not found'))) {
-
-                                // If the bot is already not in the group, just mark as inactive
-                                await groupService.deactivateGroup(groupId);
-
-                                await ctx.editMessageText(
-                                  `Bot is no longer in *${group.groupName}*\n\n` +
-                                  `The group has been marked as inactive in the database.`,
-                                  {
-                                    parse_mode: 'Markdown',
-                                    reply_markup: {
-                                      inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
-                                    }
-                                  }
-                                );
-                              } else {
-                                // For other errors, show error message
-                                await ctx.editMessageText(
-                                  `❌ Error removing bot from group\n\n` +
-                                  `Please try manually removing the bot from the group.\n\n` +
-                                  `Error: ${leaveError.description || 'Unknown error'}`,
-                                  {
-                                    parse_mode: 'Markdown',
-                                    reply_markup: {
-                                      inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
-                                    }
-                                  }
-                                );
-                              }
-                            }
-                          } catch (error) {
-                            console.error(`[Group Removal] Error processing removal confirmation:`, error);
-                            await ctx.reply('An error occurred while removing the bot. Please try again later.');
-                          }
-                        } else if (callbackData.startsWith('group_remove_')) {
-                          // Remove bot from group
-                          const groupId = callbackData.replace('group_remove_', '');
-                          console.log(`[Callback] User ${ctx.from.id} requesting to remove bot from group ${groupId}`);
-                          await handleGroupRemoval(ctx, groupId);
-                        } else {
-                          // Regular group selection
-                          const groupId = callbackData.replace('group_', '');
-                          console.log(`[Callback] User ${ctx.from.id} selected group ${groupId}`);
-                          await handleGroupSelection(ctx, groupId);
-                        }
-                      } else {
-                        console.log(`[Callback] Unknown callback query from user ${ctx.from.id}: ${callbackData}`);
-                        await ctx.answerCbQuery('This feature is not implemented yet.');
-                      }
-                  }
-                });
-
-                // Initialize global userStates map with monitoring
-                if (!global.userStates) {
-                  global.userStates = new Map();
-                  console.log(`[State] Initialized global userStates map`);
-
-                  // Add a periodic cleanup for stale states (every 5 minutes)
-                  setInterval(() => {
-                    const now = Date.now();
-                    let expiredCount = 0;
-
-                    // Loop through all states and remove any older than 30 minutes
-                    for (const [userId, state] of global.userStates.entries()) {
-                      if (now - state.timestamp > 30 * 60 * 1000) { // 30 minutes
-                        global.userStates.delete(userId);
-                        expiredCount++;
-                      }
+                      );
+                      return;
                     }
 
-                    if (expiredCount > 0) {
-                      console.log(`[State] Cleaned up ${expiredCount} expired states. Current state count: ${global.userStates.size}`);
-                    }
-                  }, 5 * 60 * 1000); // Run every 5 minutes
-                }
-
-                // Function to handle the API key setup flow
-                async function handleApiKeySetup(ctx) {
-                  console.log(`[API Key Setup] User ${ctx.from.id} (${ctx.from.username || 'no username'}) starting API key setup`);
-                  await ctx.answerCbQuery('Setting up your Fullmetal API Key...');
-
-                  const message =
-                    `Please enter your personal Fullmetal API Key.\n\n` +
-                    `This API key will be associated with your Telegram account and used for:\n` +
-                    `• Adding the bot to groups you manage\n` +
-                    `• Processing messages in those groups\n` +
-                    `• Billing for API usage\n\n` +
-                    `You can get your API key from https://www.fullmetal.ai\n\n` +
-                    `Reply to this message with your API key, or type /cancel to abort.`;
-
-                  await ctx.reply(message);
-
-                  // Here we'll use a simple global map to track user states
-                  if (!global.userStates) {
-                    global.userStates = new Map();
-                    console.log(`[API Key Setup] Initializing global userStates map`);
+                    // No existing groups, continue with normal flow
+                  } catch (error) {
+                    console.error(`[Get Started] Error checking existing groups:`, error);
+                    // Continue with the normal flow as a fallback
                   }
 
-                  // Log current state if any
-                  const userId = ctx.from.id.toString();
-                  if (global.userStates.has(userId)) {
-                    const oldState = global.userStates.get(userId);
-                    console.log(`[API Key Setup] User ${userId} had previous state: ${JSON.stringify(oldState)}`);
-                  }
+                  // Ask for group name
+                  await safeEditMessageText(ctx,
+                    `*Get Started: Add Bot to Group*\n\n` +
+                    `Please enter the name of the group you want to add me to.\n\n` +
+                    `This name will be used to prepare custom settings for your group.`,
+                    { parse_mode: 'Markdown' }
+                  );
 
-                  // Set the state for this user to indicate waiting for API key
-                  const newState = {
-                    waitingForApiKey: true,
+                  // Set user state to wait for group name
+                  global.userStates.set(userId, {
+                    waitingFor: 'group_name',
                     timestamp: Date.now()
-                  };
-                  global.userStates.set(userId, newState);
+                  });
 
-                  console.log(`[API Key Setup] Set user ${userId} state to: ${JSON.stringify(newState)}, total users waiting: ${global.userStates.size}`);
-
-                  // Add a way for the user to go back to the main menu
-                  const keyboard = {
-                    inline_keyboard: [
-                      [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
-                    ]
-                  };
-
-                  await ctx.reply('Type /cancel to abort this setup.', { reply_markup: keyboard });
+                  // Help text with cancel option
+                  await ctx.reply(
+                    'Type the name of your group, or /cancel to abort.',
+                    {
+                      reply_markup: {
+                        inline_keyboard: [
+                          [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                        ]
+                      }
+                    }
+                  );
                 }
 
-                // Function to handle API key removal
-                async function handleApiKeyRemoval(ctx) {
-                  console.log(`[API Key Removal] User ${ctx.from.id} (${ctx.from.username || 'no username'}) starting API key removal`);
-                  await ctx.answerCbQuery('Processing API key removal...');
+                // Functions to handle custom instructions
+                async function handleUseDefaultInstructions(ctx) {
+                  // Use default instructions for the group
+                  console.log(`[Get Started] User ${ctx.from.id} using default instructions`);
+                  await ctx.answerCbQuery('Using default instructions...');
 
-                  const telegramUserId = ctx.from.id.toString();
+                  // Get state
+                  const userId = ctx.from.id.toString();
+                  const state = global.userStates.get(userId);
+
+                  if (!state || !state.groupName) {
+                    // Something went wrong, go back to main menu
+                    console.log(`[Get Started] Missing group name in state for user ${userId}`);
+                    await ctx.reply('⚠️ Error: Group name not found. Please start again.');
+
+                    // Show main menu
+                    const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
+                    await ctx.reply(welcomeMessage, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                    return;
+                  }
+
+                  const groupName = state.groupName;
+
+                  // Clear the waiting state
+                  global.userStates.delete(userId);
+
+                  // Provide link to add bot to the group with default instructions
+                  await safeEditMessageText(ctx,
+                    `✅ Bot is ready to be added to "${groupName}" with default settings!\n\n` +
+                    `Click the button below to add the bot to your group:`,
+                    {
+                      reply_markup: {
+                        inline_keyboard: [
+                          [{ text: '➕ Add Bot to Group', url: `https://t.me/${ctx.botInfo.username}?startgroup=true` }],
+                          [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                        ]
+                      }
+                    }
+                  );
+                }
+
+                async function handleSetCustomInstructions(ctx) {
+                  console.log(`[Get Started] User ${ctx.from.id} setting custom instructions`);
+                  await ctx.answerCbQuery('Setting up custom instructions...');
+
+                  // Get state
+                  const userId = ctx.from.id.toString();
+                  const state = global.userStates.get(userId);
+
+                  if (!state || !state.groupName) {
+                    // Something went wrong, go back to main menu
+                    console.log(`[Get Started] Missing group name in state for user ${userId}`);
+                    await ctx.reply('⚠️ Error: Group name not found. Please start again.');
+
+                    // Show main menu
+                    const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
+                    await ctx.reply(welcomeMessage, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                    return;
+                  }
+
+                  // Update state to wait for custom instructions
+                  global.userStates.set(userId, {
+                    waitingFor: 'custom_instructions',
+                    groupName: state.groupName,
+                    timestamp: Date.now()
+                  });
+
+                  // Get default instructions
+                  const defaultInstructions = agent.summary.system || 'No default instructions set for this agent.';
+
+                  // Ask for custom instructions and include the default instructions for reference
+                  await safeEditMessageText(ctx,
+                    `*Group: ${state.groupName}*\n\n` +
+                    `Please type your custom instructions for the bot in this group.\n\n` +
+                    `These instructions will tell me how to behave, what's allowed/not allowed, and any special rules for the group.\n\n` +
+                    `*Default System Instructions (you can copy and modify):*\n` +
+                    `\`\`\`\n${defaultInstructions}\n\`\`\`\n\n` +
+                    `Type or paste your instructions now, or type /cancel to abort.`,
+                    { parse_mode: 'Markdown' }
+                  );
+                }
+
+                async function handleViewGroupInstructions(ctx, groupName) {
+                  console.log(`[Group Management] User ${ctx.from.id} viewing instructions for group ${groupName}`);
+                  await ctx.answerCbQuery('Loading saved instructions...');
+
+                  // Get instructions from pending map
+                  if (global.pendingGroupInstructions && global.pendingGroupInstructions.has(groupName)) {
+                    const instructions = global.pendingGroupInstructions.get(groupName);
+                    await safeEditMessageText(ctx,
+                      `*Saved Instructions for "${groupName}"*\n\n` +
+                      `\`\`\`\n${instructions}\n\`\`\`\n\n` +
+                      `These instructions will be applied when you add the bot to this group.`,
+                      {
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                          inline_keyboard: [
+                            [{ text: '➕ Add Bot to Group', url: `https://t.me/${ctx.botInfo.username}?startgroup=true` }],
+                            [{ text: '« Back', callback_data: 'back_to_main' }]
+                          ]
+                        }
+                      }
+                    );
+                  } else {
+                    await safeEditMessageText(ctx,
+                      `No saved instructions found for "${groupName}".\n\n` +
+                      `You may have already added the bot to this group, or the instructions expired.`,
+                      {
+                        reply_markup: {
+                          inline_keyboard: [
+                            [{ text: '« Back', callback_data: 'back_to_main' }]
+                          ]
+                        }
+                      }
+                    );
+                  }
+                }
+
+                // Group management functions
+                async function handleGroupSelection(ctx, groupId) {
+                  console.log(`[Group Management] User ${ctx.from.id} selecting group ${groupId}`);
+                  await ctx.answerCbQuery('Loading group information...');
 
                   try {
-                    // Check if user has an API key to remove
-                    const User = require('./models/User');
-                    const userWithApiKey = await User.findOne({ telegramUserId });
+                    // Get group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
 
-                    if (!userWithApiKey || !userWithApiKey.apiKey || userWithApiKey.apiKey.length === 0) {
-                      await ctx.reply('❌ You don\'t have a personal API key configured to remove.');
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
+                      });
+                      return;
+                    }
 
-                      // Return to main menu
-                      const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
-                      await ctx.reply(welcomeMessage, {
-                        reply_markup: keyboard,
-                        parse_mode: 'Markdown'
+                    // Get bot permissions in this group
+                    let botPermissions = 'Unknown';
+                    let isAdmin = false;
+
+                    try {
+                      const botMember = await ctx.telegram.getChatMember(groupId, ctx.botInfo.id);
+                      isAdmin = botMember.status === 'administrator';
+                      botPermissions = isAdmin ? 'Administrator' : botMember.status;
+                    } catch (error) {
+                      console.error(`[Group Management] Error getting bot permissions for group ${groupId}:`, error);
+                      botPermissions = 'Error checking permissions';
+                    }
+
+                    // Build group info message
+                    let message = `*Group: ${group.groupName}*\n\n`;
+                    message += `*Status*\n`;
+                    message += `• Type: ${group.groupType === 'supergroup' ? 'Supergroup' : 'Group'}\n`;
+                    message += `• Bot Status: ${botPermissions}\n`;
+                    message += `• Moderation: ${group.moderationEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+                    message += `• Active: ${group.isActive ? '✅ Yes' : '❌ No'}\n\n`;
+
+                    if (group.customInstructions) {
+                      message += `*Custom Instructions*\n`;
+                      const shortInstructions = group.customInstructions.substring(0, 200);
+                      message += `\`\`\`\n${shortInstructions}${group.customInstructions.length > 200 ? '...' : ''}\n\`\`\`\n\n`;
+                    } else {
+                      message += `*Using Default Instructions*\n\n`;
+                    }
+
+                    // Create action buttons
+                    const actionButtons = [];
+
+                    // Moderation toggle button
+                    if (group.moderationEnabled) {
+                      actionButtons.push([{ text: '🔴 Disable Moderation', callback_data: `group_mod_off_${groupId}` }]);
+                    } else {
+                      actionButtons.push([{ text: '🟢 Enable Moderation', callback_data: `group_mod_on_${groupId}` }]);
+                    }
+
+                    // Instructions update button
+                    if (group.customInstructions) {
+                      actionButtons.push([
+                        { text: '📝 Update Instructions', callback_data: `group_update_instructions_${groupId}` },
+                        { text: '🔄 Reset to Default', callback_data: `group_reset_instructions_${groupId}` }
+                      ]);
+                    } else {
+                      actionButtons.push([{ text: '📝 Set Custom Instructions', callback_data: `group_update_instructions_${groupId}` }]);
+                    }
+
+                    // API key button
+                    actionButtons.push([{ text: '🔑 Manage API Key', callback_data: `group_apikey_${groupId}` }]);
+
+                    // Remove bot button
+                    actionButtons.push([{ text: '❌ Remove Bot from Group', callback_data: `group_remove_${groupId}` }]);
+
+                    // Back button
+                    actionButtons.push([{ text: '« Back to Groups', callback_data: 'list_groups' }]);
+
+                    const keyboard = {
+                      inline_keyboard: actionButtons
+                    };
+
+                    await safeEditMessageText(ctx, message, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                  } catch (error) {
+                    console.error(`[Group Management] Error handling group selection:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while loading group information. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                      }
+                    });
+                  }
+                }
+
+                async function handleGroupRemoval(ctx, groupId) {
+                  console.log(`[Group Management] User ${ctx.from.id} requesting bot removal from group ${groupId}`);
+                  await ctx.answerCbQuery('Processing removal request...');
+
+                  try {
+                    // Get group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
+
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
                       });
                       return;
                     }
 
                     // Show confirmation message
-                    const confirmationMessage = `⚠️ *Are you sure you want to remove your API key?*\n\n` +
+                    const confirmMessage = `⚠️ *Are you sure you want to remove the bot from "${group.groupName}"?*\n\n` +
                       `This will:\n` +
-                      `• Remove your personal API key from this bot\n` +
-                      `• Prevent you from adding the bot to new groups\n` +
-                      `• Eventually stop moderation in existing groups (until a new API key is set)\n\n` +
-                      `To confirm, click "Yes, Remove API Key" below:`;
+                      `• Remove the bot from the group\n` +
+                      `• Disable all moderation features\n` +
+                      `• Preserve your group settings for if you add the bot again later\n\n` +
+                      `To confirm, click "Yes, Remove Bot" below:`;
 
-                    const confirmationKeyboard = {
+                    const keyboard = {
                       inline_keyboard: [
                         [
-                          { text: '✅ Yes, Remove API Key', callback_data: 'confirm_remove_apikey' },
-                          { text: '❌ Cancel', callback_data: 'back_to_main' }
+                          { text: '✅ Yes, Remove Bot', callback_data: `group_remove_confirm_${groupId}` },
+                          { text: '❌ Cancel', callback_data: `group_${groupId}` }
                         ]
                       ]
                     };
 
-                    await ctx.reply(confirmationMessage, {
-                      reply_markup: confirmationKeyboard,
-                      parse_mode: 'Markdown'
-                    });
-
-                  } catch (error) {
-                    console.error(`[API Key Removal] Error checking API key:`, error);
-                    await ctx.reply('⚠️ An error occurred while checking your API key. Please try again later.');
-
-                    // Back to main menu
-                    const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
-                    await ctx.reply(welcomeMessage, {
+                    await safeEditMessageText(ctx, confirmMessage, {
                       reply_markup: keyboard,
                       parse_mode: 'Markdown'
+                    });
+                  } catch (error) {
+                    console.error(`[Group Management] Error handling group removal:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while processing your request. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                      }
                     });
                   }
                 }
 
-                // Function to handle confirmed API key removal
-                async function handleConfirmApiKeyRemoval(ctx) {
-                  console.log(`[API Key Removal] User ${ctx.from.id} confirmed API key removal`);
-                  await ctx.answerCbQuery('Removing API key...');
-
-                  const telegramUserId = ctx.from.id.toString();
+                async function toggleGroupModeration(ctx, groupId, enable) {
+                  console.log(`[Group Management] User ${ctx.from.id} ${enable ? 'enabling' : 'disabling'} moderation for group ${groupId}`);
+                  await ctx.answerCbQuery(`${enable ? 'Enabling' : 'Disabling'} moderation...`);
 
                   try {
-                    // Get user record
-                    const User = require('./models/User');
-                    const user = await User.findOne({ telegramUserId });
+                    // Update moderation status
+                    await groupService.updateGroupModeration(groupId, enable);
 
-                    if (!user) {
-                      await ctx.reply('❌ No user account found.');
+                    // Get updated group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
+
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
+                      });
                       return;
                     }
 
-                    // Store email for confirmation message
-                    const userEmail = user.email;
+                    // Show success message
+                    const statusMessage = `✅ Moderation has been ${enable ? 'enabled' : 'disabled'} for "${group.groupName}".\n\n` +
+                      `${enable ?
+                        'The bot will now actively moderate messages according to its instructions.' :
+                        'The bot will no longer moderate messages but will still respond to commands and direct mentions.'}`;
 
-                    // Remove the telegramUserId association but keep the API key in the database
-                    user.telegramUserId = null;
-                    await user.save();
+                    const keyboard = {
+                      inline_keyboard: [
+                        [{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]
+                      ]
+                    };
 
-                    console.log(`[API Key Removal] Removed telegramUserId association for user ${telegramUserId}`);
-
-                    // Success message
-                    await ctx.reply(`✅ Your API key has been successfully removed.\n\nYou can still chat with me using the bot's shared API key, but you can no longer add me to groups or manage existing groups.\n\nYou can set up a new API key at any time from the main menu.`);
-
-                    // Show updated menu
-                    const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
-                    await ctx.reply(welcomeMessage, {
-                      reply_markup: keyboard,
-                      parse_mode: 'Markdown'
+                    await safeEditMessageText(ctx, statusMessage, {
+                      reply_markup: keyboard
                     });
 
+                    // Also send a message to the group about the change
+                    try {
+                      await ctx.telegram.sendMessage(groupId,
+                        `🔔 *Moderation Status Change*\n\n` +
+                        `Moderation has been ${enable ? 'enabled' : 'disabled'} for this group by an admin.\n\n` +
+                        `${enable ?
+                          'I will now actively moderate messages according to my instructions.' :
+                          'I will no longer moderate messages but will still respond to commands and direct mentions.'}`,
+                        { parse_mode: 'Markdown' }
+                      );
+                    } catch (notifyError) {
+                      console.error(`[Group Management] Error notifying group ${groupId} about moderation change:`, notifyError);
+                      // Just log this error but continue - notification to the group is optional
+                    }
                   } catch (error) {
-                    console.error(`[API Key Removal] Error removing API key:`, error);
-                    await ctx.reply('⚠️ An error occurred while removing your API key. Please try again later.');
-
-                    // Back to main menu as a fallback
-                    const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
-                    await ctx.reply(welcomeMessage, {
-                      reply_markup: keyboard,
-                      parse_mode: 'Markdown'
+                    console.error(`[Group Management] Error toggling moderation for group ${groupId}:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while updating moderation settings. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]]
+                      }
                     });
                   }
+                }
+
+                async function handleUpdateGroupInstructions(ctx, groupId) {
+                  console.log(`[Group Management] User ${ctx.from.id} updating instructions for group ${groupId}`);
+                  await ctx.answerCbQuery('Preparing to update instructions...');
+
+                  try {
+                    // Get group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
+
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
+                      });
+                      return;
+                    }
+
+                    // Get default instructions
+                    const defaultInstructions = agent.summary.system || 'No default instructions set for this agent.';
+
+                    // Show current instructions or default text
+                    let promptMessage = `*Update Instructions for ${group.groupName}*\n\n`;
+
+                    if (group.customInstructions) {
+                      promptMessage += `Current Instructions:\n`;
+                      promptMessage += `\`\`\`\n${group.customInstructions}\n\`\`\`\n\n`;
+                    } else {
+                      promptMessage += `This group is currently using the default instructions.\n\n`;
+                    }
+
+                    // Always show default instructions as reference
+                    promptMessage += `*Default System Instructions (reference):*\n`;
+                    promptMessage += `\`\`\`\n${defaultInstructions}\n\`\`\`\n\n`;
+
+                    promptMessage += `Please enter the new instructions for the bot in this group. These instructions will tell me how to behave, what's allowed/not allowed, and any special rules for the group.\n\nReply to this message with your instructions, or type /cancel to abort.`;
+
+                    // Set user state to wait for new instructions
+                    const userId = ctx.from.id.toString();
+                    global.userStates.set(userId, {
+                      waitingFor: 'group_instructions',
+                      groupId: groupId,
+                      timestamp: Date.now()
+                    });
+
+                    await safeEditMessageText(ctx, promptMessage, {
+                      parse_mode: 'Markdown'
+                    });
+
+                    // Add a way for the user to cancel
+                    await ctx.reply('Type /cancel to abort this operation.', {
+                      reply_markup: {
+                        inline_keyboard: [
+                          [{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]
+                        ]
+                      }
+                    });
+                  } catch (error) {
+                    console.error(`[Group Management] Error handling instruction update for group ${groupId}:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while loading group information. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]]
+                      }
+                    });
+                  }
+                }
+
+                async function handleResetGroupInstructions(ctx, groupId) {
+                  console.log(`[Group Management] User ${ctx.from.id} resetting instructions for group ${groupId}`);
+                  await ctx.answerCbQuery('Processing reset request...');
+
+                  try {
+                    // Get group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
+
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
+                      });
+                      return;
+                    }
+
+                    // Show confirmation message
+                    const confirmationMessage = `⚠️ *Reset Group Instructions*\n\n` +
+                      `Are you sure you want to reset the instructions for "${group.groupName}" to the default?\n\n` +
+                      `This will remove all custom instructions for this group.`;
+
+                    const keyboard = {
+                      inline_keyboard: [
+                        [
+                          { text: '✅ Yes, Reset to Default', callback_data: `group_reset_confirm_${groupId}` },
+                          { text: '❌ Cancel', callback_data: `group_${groupId}` }
+                        ]
+                      ]
+                    };
+
+                    await safeEditMessageText(ctx, confirmationMessage, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                  } catch (error) {
+                    console.error(`[Group Management] Error handling instruction reset for group ${groupId}:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while processing your request. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]]
+                      }
+                    });
+                  }
+                }
+
+                async function handleConfirmResetGroupInstructions(ctx, groupId) {
+                  console.log(`[Group Management] User ${ctx.from.id} confirming reset of instructions for group ${groupId}`);
+                  await ctx.answerCbQuery('Resetting instructions...');
+
+                  try {
+                    // Clear instructions from database
+                    await groupService.clearGroupInstructions(groupId);
+
+                    // Get updated group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
+
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
+                      });
+                      return;
+                    }
+
+                    // Show success message
+                    const successMessage = `✅ Instructions for "${group.groupName}" have been reset to default.\n\n` +
+                      `The bot will now use the agent's default instructions for this group.`;
+
+                    const keyboard = {
+                      inline_keyboard: [
+                        [{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]
+                      ]
+                    };
+
+                    await safeEditMessageText(ctx, successMessage, {
+                      reply_markup: keyboard
+                    });
+
+                    // Also notify the group about the change
+                    try {
+                      await ctx.telegram.sendMessage(groupId,
+                        `🔔 *Instructions Update*\n\n` +
+                        `The bot instructions for this group have been reset to default by an admin.`,
+                        { parse_mode: 'Markdown' }
+                      );
+                    } catch (notifyError) {
+                      console.error(`[Group Management] Error notifying group ${groupId} about instruction reset:`, notifyError);
+                      // Just log this error but continue - notification to the group is optional
+                    }
+                  } catch (error) {
+                    console.error(`[Group Management] Error confirming instruction reset for group ${groupId}:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while resetting instructions. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]]
+                      }
+                    });
+                  }
+                }
+
+                async function handleGroupApiKeySetup(ctx, groupId) {
+                  console.log(`[Group Management] User ${ctx.from.id} setting API key for group ${groupId}`);
+                  await ctx.answerCbQuery('Loading API key options...');
+
+                  try {
+                    // Get group info
+                    const group = await groupService.getGroupByTelegramId(groupId);
+
+                    if (!group) {
+                      await safeEditMessageText(ctx, 'Could not find group information. The group may have been deleted.', {
+                        reply_markup: {
+                          inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]]
+                        }
+                      });
+                      return;
+                    }
+
+                    // Get user's API key
+                    const userId = ctx.from.id.toString();
+                    const User = require('./models/User');
+                    const userWithApiKey = await User.findOne({ telegramUserId: userId });
+                    const hasUserApiKey = userWithApiKey && userWithApiKey.apiKey && userWithApiKey.apiKey.length > 0;
+
+                    if (!hasUserApiKey) {
+                      await safeEditMessageText(ctx,
+                        `❌ You don't have a personal API key configured.\n\n` +
+                        `To manage API keys for groups, you need to set up your own API key first.`,
+                        {
+                          reply_markup: {
+                            inline_keyboard: [
+                              [{ text: '🔑 Set Up API Key', callback_data: 'setup_apikey' }],
+                              [{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]
+                            ]
+                          }
+                        }
+                      );
+                      return;
+                    }
+
+                    // Check current API key for the group
+                    const currentKeyUserId = group.apiKeyUserId ? group.apiKeyUserId.toString() : null;
+                    const isUsingYourKey = currentKeyUserId && userWithApiKey && currentKeyUserId === userWithApiKey._id.toString();
+
+                    // Show message with options
+                    let message = `*API Key Settings for "${group.groupName}"*\n\n`;
+
+                    if (currentKeyUserId) {
+                      message += `This group is currently using ${isUsingYourKey ? 'your personal' : 'another user\'s'} API key.\n\n`;
+                    } else {
+                      message += `This group doesn't have an API key configured yet.\n\n`;
+                    }
+
+                    message += `What would you like to do?`;
+
+                    const keyboard = {
+                      inline_keyboard: [
+                        [{ text: '🔑 Use My API Key', callback_data: `group_apikey_set_mine_${groupId}` }]
+                      ]
+                    };
+
+                    // Add option to remove API key if using yours
+                    if (isUsingYourKey) {
+                      keyboard.inline_keyboard.push([
+                        { text: '❌ Remove My API Key', callback_data: `group_apikey_remove_${groupId}` }
+                      ]);
+                    }
+
+                    // Back button
+                    keyboard.inline_keyboard.push([
+                      { text: '« Back to Group Settings', callback_data: `group_${groupId}` }
+                    ]);
+
+                    await safeEditMessageText(ctx, message, {
+                      reply_markup: keyboard,
+                      parse_mode: 'Markdown'
+                    });
+                  } catch (error) {
+                    console.error(`[Group Management] Error handling API key setup for group ${groupId}:`, error);
+                    await safeEditMessageText(ctx, 'An error occurred while loading API key options. Please try again later.', {
+                      reply_markup: {
+                        inline_keyboard: [[{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]]
+                      }
+                    });
+                  }
+                }
+
+                // Function to handle adding the bot to a new group
+                async function handleAddToNewGroup(ctx) {
+                  console.log(`[Get Started] User ${ctx.from.id} initiating add to new group flow`);
+                  await ctx.answerCbQuery('Starting new group setup...');
+
+                  // Ask for group name
+                  await safeEditMessageText(ctx,
+                    `*Add Bot to New Group*\n\n` +
+                    `Please enter the name of the group you want to add me to.\n\n` +
+                    `This name will be used to prepare custom settings for your group.`,
+                    { parse_mode: 'Markdown' }
+                  );
+
+                  // Set user state to wait for group name
+                  const userId = ctx.from.id.toString();
+                  global.userStates.set(userId, {
+                    waitingFor: 'group_name',
+                    timestamp: Date.now()
+                  });
+
+                  // Help text with cancel option
+                  await ctx.reply(
+                    'Type the name of your group, or /cancel to abort.',
+                    {
+                      reply_markup: {
+                        inline_keyboard: [
+                          [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                        ]
+                      }
+                    }
+                  );
                 }
 
                 // Handle text messages - MAIN MESSAGE HANDLER FOR ALL CHATS
@@ -936,687 +1263,473 @@ async function initializeAgentData() {
                     return;
                   } else if (userState && userState.waitingForGroupApiKey && userState.groupId && ctx.chat.type === 'private') {
                     // Group API key setup handler is here
-                    // ... (kept the group API key handler code) ...
+                    // ... (existing code)
                     return;
-                  }
+                  } else if (userState && userState.waitingFor === 'group_name' && ctx.chat.type === 'private') {
+                    // Handle group name input
+                    const groupName = ctx.message.text.trim();
+                    console.log(`[Get Started] Received group name from user ${userId}: ${groupName}`);
 
-                  // Special test message handler - works in any chat type
-                  if (ctx.message.text.toLowerCase() === 'testing bot') {
-                    console.log(`[DEBUG] Responding to test message`);
-                    await ctx.reply('I can see your message! Bot is working.');
-                    return;
-                  }
+                    // Handle potential cancellation
+                    if (groupName.toLowerCase() === '/cancel') {
+                      console.log(`[Get Started] User ${userId} cancelled group selection`);
+                      global.userStates.delete(userId);
+                      await ctx.reply('Operation cancelled. Returning to main menu.');
 
-                  // Debug raw message for troubleshooting 
-                  console.log('Raw message object:', JSON.stringify(ctx.message, null, 2));
-                  console.log('Raw update object:', JSON.stringify(ctx.update, null, 2));
-
-                  const messageId = ctx.message.message_id;
-                  const messageText = ctx.message.text;
-                  const isGroupChat = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-                  const isPrivateChat = ctx.chat.type === 'private';
-                  const isChannelChat = ctx.chat.type === 'channel';
-                  // Check if this is a reply to the bot's message
-                  const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.botInfo.id;
-                  // Check if the bot is mentioned
-                  const isBotMentioned = messageText.includes(`@${ctx.botInfo.username}`);
-
-                  console.log(`Message received from ${userId} (${ctx.from.username || 'no username'}): ${messageText.substring(0, 50)}${messageText.length > 50 ? '...' : ''}`);
-                  console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}, Is group: ${isGroupChat}, Is private: ${isPrivateChat}, Is channel: ${isChannelChat}`);
-                  console.log(`Is reply to bot: ${isReplyToBot}, Is bot mentioned: ${isBotMentioned}`);
-
-                  // Skip processing for channels
-                  if (isChannelChat) {
-                    console.log('Ignoring message in channel as bot is not needed for channels');
-                    return;
-                  }
-
-                  // Check if this is a command
-                  if (messageText.startsWith('/')) {
-                    const parts = messageText.split(' ');
-                    const command = parts[0].toLowerCase();
-
-                    // Strip bot username from command if present
-                    const commandName = command.split('@')[0].substring(1);
-                    console.log(`Detected command: ${commandName}`);
-
-                    // Check if the command is directed to another bot
-                    if (command.includes('@')) {
-                      const targetBot = command.split('@')[1];
-                      if (targetBot !== ctx.botInfo.username) {
-                        console.log(`Command is targeted at another bot (@${targetBot}), ignoring`);
-                        return;
-                      }
-                    }
-
-                    // Let the command handlers work on it
-                    return;
-                  }
-
-                  // Check for duplicate requests
-                  if (isDuplicateRequest(userId, messageId, messageText)) {
-                    console.log(`Skipping duplicate message ${messageId} from user ${userId}`);
-                    return;
-                  }
-
-                  try {
-                    // HANDLE PRIVATE CHATS
-                    if (isPrivateChat) {
-                      console.log(`Processing private chat message from user ${userId}`);
-                      await messageController.processMessage(messageText, ctx, agent);
-                      return;
-                    }
-
-                    // HANDLE GROUP CHATS
-                    if (isGroupChat) {
-                      console.log(`Processing group message from ${ctx.from.username || userId} in ${ctx.chat.title || 'a group'}`);
-
-                      // Process all messages for moderation, but only respond to mentions/replies
-                      const isDirectedToBot = isBotMentioned || isReplyToBot;
-
-                      // Clean the message text by removing bot mentions
-                      let processedText = messageText;
-                      if (isBotMentioned) {
-                        processedText = messageText.replace(`@${ctx.botInfo.username}`, '').trim();
-                      }
-
-                      // Check if user is an admin
-                      let isUserAdmin = true;
-                      try {
-                        const member = await ctx.telegram.getChatMember(ctx.chat.id, userId);
-                        isUserAdmin = ['creator', 'administrator'].includes(member.status);
-                        console.log(`User ${userId} admin status: ${isUserAdmin ? 'Admin' : 'Not admin'}`);
-                      } catch (error) {
-                        console.error(`Error checking admin status for user ${userId}:`, error);
-                        // Default to not an admin if we can't verify
-                        isUserAdmin = false;
-                      }
-
-                      // If user is an admin, handle admin messages differently
-                      if (isUserAdmin) {
-                        console.log(`User ${userId} is an admin, skipping moderation`);
-
-                        // Only process admin messages if they're directed to the bot
-                        if (isDirectedToBot) {
-                          console.log(`Admin message is directed to bot, processing conversation`);
-                          await messageController.processMessage(processedText, ctx, agent);
-                        } else {
-                          console.log(`Admin message is not directed to bot, ignoring`);
-                        }
-                        return;
-                      }
-
-                      // Handle regular user messages
-                      // Check if moderation is enabled
-                      const shouldModerate = agent.summary?.telegram?.moderation !== false;
-                      console.log(`Moderation enabled for this agent? ${shouldModerate}`);
-
-                      if (shouldModerate) {
-                        console.log(`Moderation enabled for group ${ctx.chat.id}, analyzing message...`);
-
-                        try {
-                          // Get bot member to check permissions
-                          const botMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
-                          console.log(`Bot permissions: restrictMembers=${botMember.can_restrict_members}, deleteMessages=${botMember.can_delete_messages}`);
-
-                          // Check if the bot is not an admin, handle accordingly
-                          if (!botMember.can_restrict_members && !botMember.can_delete_messages) {
-                            console.log(`Bot doesn't have moderation permissions in this group`);
-
-                            // Process the message only if it's directed to the bot
-                            if (isDirectedToBot) {
-                              await messageController.processMessage(processedText, ctx, agent);
-                            }
-                            return;
-                          }
-
-                          // Moderate the message
-                          console.log(`Sending message to moderation service for analysis`);
-                          const moderationResult = await moderationService.moderateMessage(messageText, ctx, agent);
-                          console.log(`Moderation result for message ${messageId}: ${JSON.stringify(moderationResult)}`);
-
-                          // If no action required or action was not successful, process the message if directed to bot
-                          if (!moderationResult.actionRequired || !moderationResult.actionTaken) {
-                            if (isDirectedToBot) {
-                              await messageController.processMessage(processedText, ctx, agent);
-                            }
-                          }
-                        } catch (error) {
-                          console.error(`Error in moderation flow:`, error);
-                          // If moderation fails, still process the message if directed to bot
-                          if (isDirectedToBot) {
-                            await messageController.processMessage(processedText, ctx, agent);
-                          }
-                        }
-                      } else {
-                        // Moderation not enabled, process only if directed to the bot
-                        console.log(`Moderation not enabled, processing as normal group chat`);
-                        if (isDirectedToBot) {
-                          await messageController.processMessage(processedText, ctx, agent);
-                        }
-                      }
-                    }
-                  } catch (error) {
-                    console.error('Error processing message:', error);
-                    ctx.reply('⚠️ An error occurred while processing your request.');
-                  }
-                });
-
-                // Function to handle the admin setup flow
-                async function handleAdminSetup(ctx) {
-                  console.log(`[Admin Setup] User ${ctx.from.id} (${ctx.from.username || 'no username'}) starting admin setup`);
-                  await ctx.answerCbQuery('Setting up admin access...');
-
-                  const message =
-                    `To give me admin access to your group:\n\n` +
-                    `1. Go to your group\n` +
-                    `2. Click on the group name at the top\n` +
-                    `3. Select "Administrators"\n` +
-                    `4. Tap "Add Administrator"\n` +
-                    `5. Select this bot (@${ctx.botInfo.username})\n\n` +
-                    `Bot needs these permissions for moderation:\n` +
-                    `- Delete messages\n` +
-                    `- Ban users\n` +
-                    `- Restrict users`;
-
-                  // Add a button to show user's groups
-                  const keyboard = {
-                    inline_keyboard: [
-                      [{ text: 'Select a Group', callback_data: 'list_groups' }],
-                      [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
-                    ]
-                  };
-
-                  await ctx.reply(message, { reply_markup: keyboard });
-                  console.log(`[Admin Setup] Displayed admin setup instructions to user ${ctx.from.id}`);
-                }
-
-                // Function to handle showing help information
-                async function handleShowHelp(ctx) {
-                  console.log(`[Help] User ${ctx.from.id} (${ctx.from.username || 'no username'}) requesting help information`);
-                  await ctx.answerCbQuery('Showing help information...');
-
-                  // Check if user has their own API key
-                  const telegramUserId = ctx.from.id.toString();
-                  const userWithApiKey = await checkUserApiKey(telegramUserId);
-                  const hasUserApiKey = userWithApiKey && userWithApiKey.apiKey && userWithApiKey.apiKey.length > 0;
-
-                  // Also check agent API key as fallback
-                  const hasAgentApiKey = agent.userId && agent.userId._id && agent.userId.apiKey && agent.userId.apiKey.length > 0;
-
-                  let gettingStartedSteps = '';
-
-                  if (hasUserApiKey) {
-                    gettingStartedSteps =
-                      `*💡 Getting Started:*\n` +
-                      `1. ✅ Personal API Key is already set up\n` +
-                      `2. Add me to your group\n` +
-                      `3. Make me an admin in the group\n` +
-                      `4. I'll start moderating automatically!\n\n`;
-                  } else if (hasAgentApiKey) {
-                    gettingStartedSteps =
-                      `*💡 Getting Started:*\n` +
-                      `1. Set up your personal Fullmetal API Key (required first step)\n` +
-                      `2. Only after setting up your own API key, you can add me to groups\n` +
-                      `3. Make me an admin in the group\n` +
-                      `4. I'll start moderating automatically!\n\n` +
-                      `*Note: You can chat with me using the bot's shared API key, but to add me to groups, you must set up your own personal API key.*\n\n`;
-                  } else {
-                    gettingStartedSteps =
-                      `*💡 Getting Started:*\n` +
-                      `1. Enter your Fullmetal API Key (required first step)\n` +
-                      `2. Only after setting up API key, you can add me to groups\n` +
-                      `3. Make me an admin in the group\n` +
-                      `4. I'll start moderating automatically!\n\n`;
-                  }
-
-                  const helpMessage =
-                    `*${agent.name} - AI Moderation Bot*\n\n` +
-                    `I'm powered by Fullmetal AI to help keep your groups safe and friendly. Here's what I can do:\n\n` +
-
-                    (hasUserApiKey ? '' : `*⚠️ IMPORTANT:* You must set up your personal API key before adding me to any groups!\n\n`) +
-
-                    `*🛡️ Moderation Features:*\n` +
-                    `• Auto-detect harmful content\n` +
-                    `• Issue warnings to users\n` +
-                    `• Temporary mutes after ${warningService.WARNING_THRESHOLDS.TEMP_MUTE} warnings\n` +
-                    `• Remove users after ${warningService.WARNING_THRESHOLDS.KICK} warnings\n` +
-                    `• Permanent ban after ${warningService.WARNING_THRESHOLDS.BAN} warnings\n\n` +
-
-                    `*👮‍♂️ Admin Commands:*\n` +
-                    `/modstatus - Check moderation settings\n` +
-                    `/modon - Enable moderation\n` +
-                    `/modoff - Disable moderation\n` +
-                    `/warnings @user - Check warnings for a user\n` +
-                    `/clearwarnings @user - Clear all warnings\n\n` +
-
-                    `*👤 User Commands:*\n` +
-                    `/start - Open the main menu\n` +
-                    `/clearmemory - Clear conversation history\n` +
-                    `/showmemory - Show your conversation summary\n` +
-                    `/help - Show this help message\n\n` +
-
-                    gettingStartedSteps +
-
-                    `You can chat with me directly or @mention me in groups.`;
-
-                  const keyboard = {
-                    inline_keyboard: [
-                      [
-                        {
-                          text: '🔗 Get Fullmetal API Key',
-                          url: 'https://www.fullmetal.ai'
-                        }
-                      ],
-                      [
-                        {
-                          text: '📋 Documentation',
-                          url: 'https://www.fullmetal.ai/docs'
-                        }
-                      ],
-                      !hasUserApiKey ? [
-                        {
-                          text: '🔑 Set Up Personal API Key',
-                          callback_data: 'setup_apikey'
-                        }
-                      ] : [
-                        {
-                          text: '➕ Add to Group',
-                          url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
-                        }
-                      ],
-                      [
-                        {
-                          text: '« Back to Main Menu',
-                          callback_data: 'back_to_main'
-                        }
-                      ]
-                    ].filter(row => row.length > 0) // Remove empty rows
-                  };
-
-                  await ctx.reply(helpMessage, {
-                    reply_markup: keyboard,
-                    parse_mode: 'Markdown'
-                  });
-                  console.log(`[Help] Displayed help information to user ${ctx.from.id}`);
-                }
-
-                // Function to handle listing and selecting groups
-                async function handleGroupSelection(ctx, groupId) {
-                  console.log(`[Group Selection] User ${ctx.from.id} selected group ${groupId}`);
-                  await ctx.answerCbQuery(`Loading group settings...`);
-
-                  try {
-                    // Get group info
-                    const group = await groupService.getGroupByTelegramId(groupId);
-
-                    if (!group) {
-                      await ctx.editMessageText(`Sorry, I couldn't find information for this group. It may have been deleted.`, {
-                        reply_markup: {
-                          inline_keyboard: [
-                            [{ text: '« Back to Groups', callback_data: 'list_groups' }]
-                          ]
-                        }
+                      // Show main menu
+                      const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
+                      await ctx.reply(welcomeMessage, {
+                        reply_markup: keyboard,
+                        parse_mode: 'Markdown'
                       });
                       return;
                     }
 
-                    // Check if the group is still active
-                    if (!group.isActive) {
-                      await ctx.editMessageText(
-                        `*${group.groupName}*\n\n` +
-                        `⚠️ I'm no longer a member of this group.\n\n` +
-                        `To use me in this group again, please add me back.`, {
-                        parse_mode: 'Markdown',
-                        reply_markup: {
-                          inline_keyboard: [
-                            [{ text: '« Back to Groups', callback_data: 'list_groups' }]
-                          ]
-                        }
-                      }
-                      );
-                      return;
-                    }
-
-                    // Prepare group info message
-                    let message = `*${group.groupName}*\n\n`;
-                    message += `• Type: ${group.groupType === 'supergroup' ? 'Supergroup' : 'Group'}\n`;
-                    message += `• Members: ${group.memberCount || 'Unknown'}\n`;
-                    message += `• Moderation: ${group.moderationEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
-                    message += `• Bot Status: ${group.isActive ? '✅ Active' : '❌ Inactive'}\n\n`;
-
-                    // Check API key status
-                    const hasApiKey = !!(group.apiKeyUserId && group.apiKeyUserId.apiKey && group.apiKeyUserId.apiKey.length > 0);
-                    message += `• API Key: ${hasApiKey ? '✅ Set' : '❌ Not set'}\n`;
-
-                    if (hasApiKey && group.apiKeyUserId) {
-                      message += `• Account: ${group.apiKeyUserId.email || 'Unknown'}\n\n`;
-                    } else {
-                      message += `\n⚠️ This group needs an API key to use AI features.\n\n`;
-                    }
-
-                    // Usage statistics
-                    if (group.apiUsage) {
-                      message += `*Usage Statistics:*\n`;
-                      message += `• Messages: ${group.apiUsage.messageCount || 0}\n`;
-                      message += `• Moderations: ${group.apiUsage.moderationCount || 0}\n`;
-                      message += `• Commands: ${group.apiUsage.commandCount || 0}\n\n`;
-                    }
-
-                    // Prepare action buttons
-                    const buttons = [];
-
-                    // API key button
-                    buttons.push([
-                      {
-                        text: hasApiKey ? '🔄 Update API Key' : '🔑 Set API Key',
-                        callback_data: `group_apikey_${groupId}`
-                      }
-                    ]);
-
-                    // Moderation toggle
-                    buttons.push([
-                      {
-                        text: group.moderationEnabled ? '🛑 Disable Moderation' : '✅ Enable Moderation',
-                        callback_data: `group_mod_${group.moderationEnabled ? 'off' : 'on'}_${groupId}`
-                      }
-                    ]);
-
-                    // View group in Telegram
-                    try {
-                      const chatInviteLink = await ctx.telegram.exportChatInviteLink(groupId);
-                      if (chatInviteLink) {
-                        buttons.push([
-                          { text: '👁️ View Group', url: chatInviteLink }
-                        ]);
-                      }
-                    } catch (error) {
-                      console.error(`[Group Selection] Error getting invite link:`, error);
-                    }
-
-                    // Add remove bot button
-                    buttons.push([
-                      { text: '🚫 Remove Bot from Group', callback_data: `group_remove_${groupId}` }
-                    ]);
-
-                    // Back button
-                    buttons.push([
-                      { text: '« Back to Groups', callback_data: 'list_groups' }
-                    ]);
-
-                    // Send message with group info
-                    await ctx.editMessageText(message, {
-                      parse_mode: 'Markdown',
-                      reply_markup: {
-                        inline_keyboard: buttons
-                      }
+                    // Update state with selected group name
+                    global.userStates.set(userId, {
+                      waitingFor: 'instruction_choice',
+                      groupName: groupName,
+                      timestamp: Date.now()
                     });
 
-                    console.log(`[Group Selection] Displayed group information for ${group.groupName} to user ${ctx.from.id}`);
-                  } catch (error) {
-                    console.error(`[Group Selection] Error handling group selection:`, error);
-                    await ctx.reply(`An error occurred while loading the group information. Please try again later.`);
-                  }
-                }
+                    // Get default instructions
+                    const defaultInstructions = agent.summary.system || 'No default instructions set for this agent.';
 
-                // Function to handle setting API key for a specific group
-                async function handleGroupApiKeySetup(ctx, groupId) {
-                  console.log(`[Group API Key] User ${ctx.from.id} setting up API key for group ${groupId}`);
-                  await ctx.answerCbQuery('Setting up API key for this group...');
+                    // Show options for default or custom instructions
+                    const message = `*Group: ${groupName}*\n\n` +
+                      `How would you like to set up the bot for this group?\n\n` +
+                      `*Default Instructions:*\n\`\`\`\n${defaultInstructions.substring(0, 200)}${defaultInstructions.length > 200 ? '...' : ''}\n\`\`\`\n\n` +
+                      `Choose an option:`;
 
-                  try {
-                    // Get group info
-                    const group = await groupService.getGroupByTelegramId(groupId);
-
-                    if (!group) {
-                      await ctx.editMessageText(`Sorry, I couldn't find information for this group.`, {
-                        reply_markup: {
-                          inline_keyboard: [
-                            [{ text: '« Back to Groups', callback_data: 'list_groups' }]
-                          ]
-                        }
-                      });
-                      return;
-                    }
-
-                    const message =
-                      `*API Key Setup for ${group.groupName}*\n\n` +
-                      `Please enter your Fullmetal API Key for this group.\n\n` +
-                      `This API key will be used for all AI operations in this group, and usage will be billed to the associated account.\n\n` +
-                      `You can get your API key from https://www.fullmetal.ai\n\n` +
-                      `Reply to this message with your API key, or type /cancel to abort.`;
-
-                    await ctx.editMessageText(message, {
+                    await ctx.reply(message, {
                       parse_mode: 'Markdown',
                       reply_markup: {
                         inline_keyboard: [
-                          [{ text: '« Back to Group', callback_data: `group_${groupId}` }]
+                          [{ text: '✅ Use Default Instructions', callback_data: 'use_default_for_group' }],
+                          [{ text: '✏️ Set Custom Instructions', callback_data: 'set_custom_for_group' }],
+                          [{ text: '« Cancel', callback_data: 'back_to_main' }]
                         ]
                       }
                     });
 
-                    // Set user state to wait for API key
-                    if (!global.userStates) {
-                      global.userStates = new Map();
-                    }
+                    return;
+                  } else if (userState && userState.waitingFor === 'custom_instructions' && ctx.chat.type === 'private') {
+                    // Handle custom instructions input
+                    const instructions = ctx.message.text.trim();
+                    console.log(`[Get Started] Received custom instructions from user ${userId}`);
 
-                    const userId = ctx.from.id.toString();
-                    const newState = {
-                      waitingForGroupApiKey: true,
-                      groupId: groupId,
-                      timestamp: Date.now()
-                    };
+                    // Handle potential cancellation
+                    if (instructions.toLowerCase() === '/cancel') {
+                      console.log(`[Get Started] User ${userId} cancelled custom instructions`);
+                      global.userStates.delete(userId);
+                      await ctx.reply('Operation cancelled. Returning to main menu.');
 
-                    global.userStates.set(userId, newState);
-                    console.log(`[Group API Key] Set user ${userId} state to: ${JSON.stringify(newState)}`);
-                  } catch (error) {
-                    console.error(`[Group API Key] Error setting up group API key:`, error);
-                    await ctx.reply('An error occurred while setting up the API key. Please try again later.');
-                  }
-                }
-
-                // Function to toggle moderation for a group
-                async function toggleGroupModeration(ctx, groupId, enable) {
-                  console.log(`[Group Moderation] User ${ctx.from.id} ${enable ? 'enabling' : 'disabling'} moderation for group ${groupId}`);
-                  await ctx.answerCbQuery(`${enable ? 'Enabling' : 'Disabling'} moderation...`);
-
-                  try {
-                    // Update moderation setting in database
-                    await groupService.toggleModeration(groupId, enable);
-
-                    // Return to group info screen
-                    await handleGroupSelection(ctx, groupId);
-                  } catch (error) {
-                    console.error(`[Group Moderation] Error ${enable ? 'enabling' : 'disabling'} moderation:`, error);
-                    await ctx.reply(`An error occurred while ${enable ? 'enabling' : 'disabling'} moderation. Please try again later.`);
-                  }
-                }
-
-                // Function to handle removing the bot from a group
-                async function handleGroupRemoval(ctx, groupId) {
-                  console.log(`[Group Removal] User ${ctx.from.id} initiating removal of bot from group ${groupId}`);
-                  await ctx.answerCbQuery('Preparing to remove bot...');
-
-                  try {
-                    // Get group info
-                    const group = await groupService.getGroupByTelegramId(groupId);
-
-                    if (!group) {
-                      await ctx.editMessageText(`Sorry, I couldn't find information for this group.`, {
-                        reply_markup: {
-                          inline_keyboard: [
-                            [{ text: '« Back to Groups', callback_data: 'list_groups' }]
-                          ]
-                        }
+                      // Show main menu
+                      const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
+                      await ctx.reply(welcomeMessage, {
+                        reply_markup: keyboard,
+                        parse_mode: 'Markdown'
                       });
                       return;
                     }
 
-                    // Show confirmation dialog
-                    const message = `*Confirm Bot Removal*\n\n` +
-                      `Are you sure you want to remove the bot from *${group.groupName}*?\n\n` +
-                      `This will:\n` +
-                      `• Remove the bot from the group\n` +
-                      `• Disable all moderation features\n` +
-                      `• Keep group history and settings in case you add the bot back later`;
+                    // Store custom instructions for this group
+                    const groupName = userState.groupName;
 
-                    const confirmationButtons = [
-                      [
-                        { text: '✅ Yes, Remove Bot', callback_data: `group_remove_confirm_${groupId}` },
-                        { text: '❌ Cancel', callback_data: `group_${groupId}` }
-                      ]
-                    ];
+                    // Store this in a global map
+                    global.pendingGroupInstructions.set(groupName, instructions);
 
-                    await ctx.editMessageText(message, {
-                      parse_mode: 'Markdown',
-                      reply_markup: {
-                        inline_keyboard: confirmationButtons
+                    // Clear the waiting state
+                    global.userStates.delete(userId);
+
+                    // Provide link to add bot to the group with custom instructions
+                    await ctx.reply(
+                      `✅ Custom instructions saved for "${groupName}"!\n\n` +
+                      `Click the button below to add the bot to your group:`,
+                      {
+                        reply_markup: {
+                          inline_keyboard: [
+                            [{ text: '➕ Add Bot to Group', url: `https://t.me/${ctx.botInfo.username}?startgroup=true` }],
+                            [{ text: 'View Saved Instructions', callback_data: `view_group_instructions_${groupName}` }],
+                            [{ text: '« Back to Main Menu', callback_data: 'back_to_main' }]
+                          ]
+                        }
                       }
-                    });
+                    );
 
-                  } catch (error) {
-                    console.error(`[Group Removal] Error preparing group removal:`, error);
-                    await ctx.reply(`An error occurred while preparing to remove the bot. Please try again later.`);
+                    return;
+                  } else if (userState && userState.waitingFor === 'group_instructions' && ctx.chat.type === 'private') {
+                    // Handle updating instructions for an existing group
+                    const instructions = ctx.message.text.trim();
+                    const groupId = userState.groupId;
+                    console.log(`[Group Management] Received updated instructions for group ${groupId} from user ${userId}`);
+
+                    // Handle potential cancellation
+                    if (instructions.toLowerCase() === '/cancel') {
+                      console.log(`[Group Management] User ${userId} cancelled instruction update`);
+                      global.userStates.delete(userId);
+                      await ctx.reply('Instruction update cancelled. Returning to group settings.');
+
+                      // Show group settings
+                      const group = await groupService.getGroupByTelegramId(groupId);
+                      if (group) {
+                        await ctx.reply(`Returning to settings for group "${group.groupName}"...`);
+                        await handleGroupSelection(ctx, groupId);
+                      } else {
+                        // Fallback to main menu if group not found
+                        const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
+                        await ctx.reply(welcomeMessage, {
+                          reply_markup: keyboard,
+                          parse_mode: 'Markdown'
+                        });
+                      }
+                      return;
+                    }
+
+                    // Show loading message
+                    await ctx.reply('Updating group instructions...');
+
+                    try {
+                      // Update instructions in the database
+                      await groupService.setGroupInstructions(groupId, instructions);
+
+                      // Get updated group info
+                      const group = await groupService.getGroupByTelegramId(groupId);
+
+                      // Clear the waiting state
+                      global.userStates.delete(userId);
+
+                      // Success message
+                      await ctx.reply(
+                        `✅ Instructions updated for "${group.groupName}"!\n\n` +
+                        `The bot will now use these custom instructions for this group.`,
+                        {
+                          reply_markup: {
+                            inline_keyboard: [
+                              [{ text: '« Back to Group Settings', callback_data: `group_${groupId}` }]
+                            ]
+                          }
+                        }
+                      );
+
+                      // Also notify the group about the change
+                      try {
+                        await ctx.telegram.sendMessage(groupId,
+                          `🔔 *Instructions Update*\n\n` +
+                          `The bot instructions for this group have been updated by an admin.`,
+                          { parse_mode: 'Markdown' }
+                        );
+                      } catch (notifyError) {
+                        console.error(`[Group Management] Error notifying group ${groupId} about instruction update:`, notifyError);
+                        // Just log this error but continue - notification to the group is optional
+                      }
+                    } catch (error) {
+                      console.error(`[Group Management] Error updating instructions for group ${groupId}:`, error);
+                      await ctx.reply('⚠️ An error occurred while updating the instructions. Please try again later.');
+                    }
+
+                    return;
                   }
-                }
+                });
 
-                // Add memory-related commands
-                bot.command('clearmemory', async (ctx) => {
-                  console.log(`Clear memory command received from user: ${ctx.from.id}`);
-                  try {
-                    await messageController.clearMemory(ctx, agent);
-                  } catch (error) {
-                    console.error('Error clearing memory:', error);
-                    ctx.reply('⚠️ An error occurred while clearing conversation history.');
+                // Handle callback queries from inline buttons
+                bot.on('callback_query', async (ctx) => {
+                  console.log(`[Callback] Received: ${ctx.callbackQuery.data} from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
+
+                  const callbackData = ctx.callbackQuery.data;
+
+                  // Process different callback actions
+                  switch (callbackData) {
+                    case 'setup_apikey':
+                      console.log(`[Callback] User ${ctx.from.id} requested API key setup`);
+                      await handleApiKeySetup(ctx);
+                      break;
+
+                    case 'remove_apikey':
+                      console.log(`[Callback] User ${ctx.from.id} requested API key removal`);
+                      await handleApiKeyRemoval(ctx);
+                      break;
+
+                    case 'confirm_remove_apikey':
+                      console.log(`[Callback] User ${ctx.from.id} confirmed API key removal`);
+                      await handleConfirmApiKeyRemoval(ctx);
+                      break;
+
+                    case 'setup_admin':
+                      console.log(`[Callback] User ${ctx.from.id} requested admin setup`);
+                      await handleAdminSetup(ctx);
+                      break;
+
+                    case 'show_help':
+                      console.log(`[Callback] User ${ctx.from.id} requested help information`);
+                      await handleShowHelp(ctx);
+                      break;
+
+                    case 'back_to_main':
+                      console.log(`[Callback] User ${ctx.from.id} returning to main menu`);
+                      await safeAnswerCbQuery(ctx, 'Returning to main menu...');
+
+                      // Get menu options
+                      const { welcomeMessage, keyboard } = await generateMainMenu(ctx, agent);
+
+                      // Edit the current message instead of sending a new one
+                      await safeEditMessageText(ctx, welcomeMessage, {
+                        reply_markup: keyboard,
+                        parse_mode: 'Markdown'
+                      });
+                      console.log(`[Callback] Displayed main menu to user ${ctx.from.id}`);
+                      break;
+
+                    case 'get_started':
+                      console.log(`[Callback] User ${ctx.from.id} starting Get Started flow`);
+                      await handleGetStarted(ctx);
+                      break;
+
+                    case 'add_to_new_group':
+                      console.log(`[Callback] User ${ctx.from.id} choosing to add bot to a new group`);
+                      await handleAddToNewGroup(ctx);
+                      break;
+
+                    case 'use_default_for_group':
+                      console.log(`[Callback] User ${ctx.from.id} choosing to use default instructions`);
+                      await handleUseDefaultInstructions(ctx);
+                      break;
+
+                    case 'set_custom_for_group':
+                      console.log(`[Callback] User ${ctx.from.id} choosing to set custom instructions`);
+                      await handleSetCustomInstructions(ctx);
+                      break;
+
+                    case 'list_groups':
+                      console.log(`[Callback] User ${ctx.from.id} requested group listing`);
+                      await safeAnswerCbQuery(ctx, 'Fetching your groups...');
+
+                      try {
+                        const userId = ctx.from.id.toString();
+                        // Find user in database if exists
+                        let dbUser = null;
+                        let mongoUserId = null;
+
+                        if (agent.userId && agent.userId._id) {
+                          // Default to agent's user
+                          mongoUserId = agent.userId._id;
+                        }
+
+                        // Get groups for this agent
+                        const groups = await groupService.getGroupsByAgentId(agent._id);
+
+                        if (groups.length === 0) {
+                          // No groups found
+                          const message =
+                            `You haven't added me to any groups yet.\n\n` +
+                            `To add me to a group:\n` +
+                            `1. Open your group\n` +
+                            `2. Tap on the group name at the top\n` +
+                            `3. Select "Add member"\n` +
+                            `4. Search for @${ctx.botInfo.username}\n` +
+                            `5. Tap "Add"\n\n` +
+                            `Alternatively, use this link:\n` +
+                            `https://t.me/${ctx.botInfo.username}?startgroup=true`;
+
+                          // Check if agent has a validated API key
+                          const hasValidApiKey = agent.userId && agent.userId._id && agent.userId.apiKey && agent.userId.apiKey.length > 0;
+
+                          const groupsKeyboard = {
+                            inline_keyboard: [
+                              hasValidApiKey ?
+                                [{ text: '➕ Add to Group', url: `https://t.me/${ctx.botInfo.username}?startgroup=true` }] :
+                                [{ text: '🔑 Set Up API Key First', callback_data: 'setup_apikey' }],
+                              [{ text: '« Back', callback_data: 'back_to_main' }]
+                            ]
+                          };
+
+                          await safeEditMessageText(ctx, message, { reply_markup: groupsKeyboard });
+                          console.log(`[Callback] Displayed empty group list to user ${ctx.from.id}`);
+                        } else {
+                          // Build group list message
+                          let message = `*Your Groups (${groups.length})*\n\n`;
+
+                          // Create inline keyboard with groups
+                          const groupButtons = [];
+
+                          for (const group of groups) {
+                            message += `• *${group.groupName}*\n`;
+                            message += `  - Type: ${group.groupType === 'supergroup' ? 'Supergroup' : 'Group'}\n`;
+                            message += `  - Moderation: ${group.moderationEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+                            message += `  - API Key: ${group.apiKeyUserId ? '✅ Set' : '❌ Not set'}\n\n`;
+
+                            // Add button for this group
+                            groupButtons.push([
+                              {
+                                text: group.groupName,
+                                callback_data: `group_${group.telegramGroupId}`
+                              }
+                            ]);
+                          }
+
+                          // Add back button
+                          groupButtons.push([
+                            { text: '« Back to Main Menu', callback_data: 'back_to_main' }
+                          ]);
+
+                          const groupsKeyboard = {
+                            inline_keyboard: groupButtons
+                          };
+
+                          await safeEditMessageText(ctx, message, {
+                            reply_markup: groupsKeyboard,
+                            parse_mode: 'Markdown'
+                          });
+                          console.log(`[Callback] Displayed group list to user ${ctx.from.id}`);
+                        }
+                      } catch (error) {
+                        console.error(`[Callback] Error listing groups for user ${ctx.from.id}:`, error);
+                        await safeAnswerCbQuery(ctx, 'Error fetching groups. Please try again later.');
+                      }
+                      break;
+
+                    default:
+                      // Handle group-related callbacks (they start with "group_")
+                      if (callbackData.startsWith('group_')) {
+                        // Extract the group ID from the callback data
+                        if (callbackData.startsWith('group_api')) {
+                          console.log(`[Callback] Group API key callback received: ${callbackData}`);
+                          // Group API key related callbacks
+                          if (callbackData.startsWith('group_apikey_')) {
+                            const groupId = callbackData.replace('group_apikey_', '');
+                            console.log(`[Callback] User ${ctx.from.id} setting API key for group ${groupId}`);
+                            await handleGroupApiKeySetup(ctx, groupId);
+                          }
+                        } else if (callbackData.startsWith('group_mod_')) {
+                          // Group moderation settings
+                          if (callbackData.startsWith('group_mod_on_')) {
+                            const groupId = callbackData.replace('group_mod_on_', '');
+                            console.log(`[Callback] User ${ctx.from.id} enabling moderation for group ${groupId}`);
+                            await toggleGroupModeration(ctx, groupId, true);
+                          } else if (callbackData.startsWith('group_mod_off_')) {
+                            const groupId = callbackData.replace('group_mod_off_', '');
+                            console.log(`[Callback] User ${ctx.from.id} disabling moderation for group ${groupId}`);
+                            await toggleGroupModeration(ctx, groupId, false);
+                          }
+                        } else if (callbackData.startsWith('group_update_instructions_')) {
+                          // Handle updating group instructions
+                          const groupId = callbackData.replace('group_update_instructions_', '');
+                          console.log(`[Callback] User ${ctx.from.id} updating instructions for group ${groupId}`);
+                          await handleUpdateGroupInstructions(ctx, groupId);
+                        } else if (callbackData.startsWith('group_reset_instructions_')) {
+                          // Handle resetting group instructions to default
+                          const groupId = callbackData.replace('group_reset_instructions_', '');
+                          console.log(`[Callback] User ${ctx.from.id} resetting instructions for group ${groupId}`);
+                          await handleResetGroupInstructions(ctx, groupId);
+                        } else if (callbackData.startsWith('group_reset_confirm_')) {
+                          // Handle confirmed reset of group instructions
+                          const groupId = callbackData.replace('group_reset_confirm_', '');
+                          console.log(`[Callback] User ${ctx.from.id} confirmed reset of instructions for group ${groupId}`);
+                          await handleConfirmResetGroupInstructions(ctx, groupId);
+                        } else if (callbackData.startsWith('group_remove_confirm_')) {
+                          // Handle confirmation of group removal
+                          const groupId = callbackData.replace('group_remove_confirm_', '');
+                          console.log(`[Callback] User ${ctx.from.id} confirmed removal of bot from group ${groupId}`);
+
+                          // Handle removal confirmation
+                          try {
+                            await safeAnswerCbQuery(ctx, 'Removing bot from group...');
+
+                            // Get group info
+                            const group = await groupService.getGroupByTelegramId(groupId);
+
+                            if (!group) {
+                              await safeAnswerCbQuery(ctx, 'Error: Group not found');
+                              await safeEditMessageText(ctx, 'Could not find group information. Please try again or contact support.',
+                                { reply_markup: { inline_keyboard: [[{ text: '« Back to Groups', callback_data: 'list_groups' }]] } });
+                              return;
+                            }
+
+                            // Try to leave the group
+                            try {
+                              await ctx.telegram.leaveChat(groupId);
+                              console.log(`[Group Removal] Successfully left group ${groupId}`);
+
+                              // Show success message
+                              await safeEditMessageText(ctx,
+                                `✅ Successfully removed bot from *${group.groupName}*\n\n` +
+                                `The bot has left the group and all moderation features are now disabled.\n\n` +
+                                `You can add the bot back at any time.`, {
+                                parse_mode: 'Markdown',
+                                reply_markup: {
+                                  inline_keyboard: [
+                                    [{ text: '« Back to Groups', callback_data: 'list_groups' }]
+                                  ]
+                                }
+                              });
+
+                              // Mark the group as inactive
+                              await groupService.deactivateGroup(groupId);
+
+                            } catch (leaveError) {
+                              console.error(`[Group Removal] Error leaving group ${groupId}:`, leaveError);
+
+                              // If we get a "bot is not a member" error, just mark as inactive
+                              if (leaveError.description && (
+                                leaveError.description.includes('bot is not a member') ||
+                                leaveError.description.includes('chat not found')
+                              )) {
+                                console.log(`[Group Removal] Bot is no longer in group ${groupId}, marking as inactive`);
+                                await groupService.deactivateGroup(groupId);
+
+                                await safeEditMessageText(ctx,
+                                  `Bot is no longer in *${group.groupName}*\n\n` +
+                                  `The group has been marked as inactive in the database.`,
+                                  {
+                                    parse_mode: 'Markdown',
+                                    reply_markup: {
+                                      inline_keyboard: [
+                                        [{ text: '« Back to Groups', callback_data: 'list_groups' }]
+                                      ]
+                                    }
+                                  }
+                                );
+                              } else {
+                                // For other errors, show error message
+                                await safeEditMessageText(ctx,
+                                  `❌ Error removing bot from group\n\n` +
+                                  `Please try manually removing the bot from the group.\n\n` +
+                                  `Error: ${leaveError.description || 'Unknown error'}`,
+                                  {
+                                    reply_markup: {
+                                      inline_keyboard: [
+                                        [{ text: '« Back to Groups', callback_data: 'list_groups' }]
+                                      ]
+                                    }
+                                  }
+                                );
+                              }
+                            }
+                          } catch (error) {
+                            console.error(`[Group Removal] Error processing removal confirmation:`, error);
+                            await safeAnswerCbQuery(ctx, 'An error occurred while removing the bot. Please try again later.');
+                          }
+                        } else if (callbackData.startsWith('group_remove_')) {
+                          // Show removal confirmation
+                          const groupId = callbackData.replace('group_remove_', '');
+                          console.log(`[Callback] User ${ctx.from.id} requesting removal of bot from group ${groupId}`);
+                          await handleGroupRemoval(ctx, groupId);
+                        } else {
+                          // Otherwise, assume it's a group selection
+                          const groupId = callbackData.replace('group_', '');
+                          console.log(`[Callback] User ${ctx.from.id} selecting group ${groupId}`);
+                          await handleGroupSelection(ctx, groupId);
+                        }
+                      } else if (callbackData.startsWith('view_group_instructions_')) {
+                        // Handle viewing group instructions
+                        const groupName = callbackData.replace('view_group_instructions_', '');
+                        console.log(`[Callback] User ${ctx.from.id} viewing instructions for group ${groupName}`);
+                        await handleViewGroupInstructions(ctx, groupName);
+                      } else {
+                        console.log(`[Callback] Unknown callback query from user ${ctx.from.id}: ${callbackData}`);
+                        await safeAnswerCbQuery(ctx, 'This feature is not implemented yet.');
+                      }
                   }
-                });
-
-                bot.command('showmemory', async (ctx) => {
-                  console.log(`Show memory command received from user: ${ctx.from.id}`);
-                  try {
-                    await messageController.showMemory(ctx, agent);
-                  } catch (error) {
-                    console.error('Error showing memory:', error);
-                    ctx.reply('⚠️ An error occurred while retrieving conversation history.');
-                  }
-                });
-
-                // Add test command for debugging
-                bot.command('test', async (ctx) => {
-                  console.log(`TEST command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
-                  console.log(`Chat type: ${ctx.chat.type}, Chat ID: ${ctx.chat.id}`);
-                  await ctx.reply('Test command received! Bot is working.');
-                });
-
-                // Add privacy mode check command
-                bot.command('privacy', async (ctx) => {
-                  console.log(`PRIVACY command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
-
-                  const message = `*Telegram Bot Privacy Settings*\n\n` +
-                    `If the bot is not responding to regular messages, it might be due to Telegram's Privacy Mode being enabled.\n\n` +
-
-                    `*Current Status:*\n` +
-                    `• Commands: ✅ Working\n` +
-                    `• Direct messages: ${ctx.chat.type === 'private' ? '✅ Should work' : '❓ Unknown'}\n` +
-                    `• Group messages: ❓ May not work if privacy mode is enabled\n\n` +
-
-                    `*How to disable Privacy Mode:*\n` +
-                    `1. Open @BotFather in Telegram\n` +
-                    `2. Send /mybots\n` +
-                    `3. Select this bot (@${ctx.botInfo.username})\n` +
-                    `4. Go to Bot Settings > Group Privacy\n` +
-                    `5. Select 'Disable'\n` +
-                    `6. Restart your bot server\n\n` +
-
-                    `*Test Messages:*\n` +
-                    `• Use /test to confirm the bot can receive commands\n` +
-                    `• Use /mod [text] to test moderation without privacy mode\n\n` +
-
-                    `Note: Even with privacy mode ON, the bot can still process commands like /modstatus, /modon and /modoff.`;
-
-                  await ctx.replyWithMarkdown(message);
-                });
-
-                // Add dedicated handler for private chat messages
-                // REMOVED: Consolidating all handling in the main message handler below
-                // bot.on('text', async (ctx) => {
-                //   // Only process messages in private chats
-                //   if (ctx.chat.type !== 'private') {
-                //     return; // Let other handlers process group messages
-                //   }
-                // 
-                //   // Skip processing commands (let command handlers deal with those)
-                //   if (ctx.message.text.startsWith('/')) {
-                //     return;
-                //   }
-                // 
-                //   console.log(`[Private] Message received from user ${ctx.from.id}: "${ctx.message.text.substring(0, 50)}${ctx.message.text.length > 50 ? '...' : ''}"`);
-                // 
-                //   try {
-                //     // Process the message using messageController
-                //     await messageController.processMessage(ctx.message.text, ctx, agent);
-                //   } catch (error) {
-                //     console.error('[Private] Error processing private message:', error);
-                //     ctx.reply('⚠️ An error occurred while processing your message. Please try again later.');
-                //   }
-                // });
-
-                // Debug handler for ANY update from Telegram
-                bot.use((ctx, next) => {
-                  console.log('====== RAW UPDATE RECEIVED ======');
-                  console.log(`Update type: ${ctx.updateType}`);
-                  console.log(`Chat ID: ${ctx.chat?.id}, Chat Type: ${ctx.chat?.type}`);
-
-                  // Check for message text in any form
-                  if (ctx.message?.text) {
-                    console.log(`MESSAGE TEXT: "${ctx.message.text}"`);
-                  } else if (ctx.channelPost?.text) {
-                    console.log(`CHANNEL POST TEXT: "${ctx.channelPost.text}"`);
-                  }
-
-                  // Continue to the next middleware
-                  return next();
-                });
-
-                // Add handler for channel posts
-                bot.on('channel_post', async (ctx) => {
-                  console.log('*** CHANNEL POST RECEIVED ***');
-                  console.log(`Channel ID: ${ctx.chat.id}, Channel title: ${ctx.chat.title || 'Unnamed channel'}`);
-                  console.log('Ignoring channel post as bot is not needed for channels');
-                  // No processing for channel posts
-                });
-
-                // Register bot commands with BotFather
-                bot.telegram.setMyCommands([
-                  { command: 'start', description: 'Start the bot and see main menu' },
-                  { command: 'help', description: 'Show help information and commands' },
-                  { command: 'modstatus', description: 'Check moderation status and settings' },
-                  { command: 'modon', description: 'Enable message moderation in this group' },
-                  { command: 'modoff', description: 'Disable message moderation in this group' },
-                  { command: 'warnings', description: 'Check warnings for a specific user' },
-                  { command: 'clearwarnings', description: 'Clear all warnings for a user' }
-                ], { scope: { type: 'all_chat_administrators' } }).catch(error => {
-                  console.error('Failed to register admin commands:', error);
-                }).then(() => {
-                  // Also register for all users
-                  return bot.telegram.setMyCommands([
-                    { command: 'start', description: 'Start the bot and see main menu' },
-                    { command: 'help', description: 'Show help information and commands' },
-                    { command: 'clearmemory', description: 'Clear your conversation history' },
-                    { command: 'showmemory', description: 'Show a summary of your conversation' },
-                    { command: 'test', description: 'Test if the bot is working properly' }
-                  ], { scope: { type: 'all_private_chats' } });
-                }).then(() => {
-                  // Also register for default scope (all users in all chats)
-                  return bot.telegram.setMyCommands([
-                    { command: 'start', description: 'Start the bot and see main menu' },
-                    { command: 'help', description: 'Show help information and commands' },
-                    { command: 'test', description: 'Test if the bot is working properly' }
-                  ]);
-                }).then(() => {
-                  console.log('Bot commands registered with Telegram');
-                }).catch(error => {
-                  console.error('Failed to register commands:', error);
                 });
 
                 // Handle when bot is added to or removed from a group
@@ -1702,6 +1815,15 @@ async function initializeAgentData() {
                         addedByUserId: userWithApiKey._id,  // Store who added the bot
                         apiKeyUserId: apiKeyUserId          // Use the API key of the user who added the bot
                       };
+
+                      // Check if there are pending instructions for this group
+                      if (global.pendingGroupInstructions && global.pendingGroupInstructions.has(chatTitle)) {
+                        console.log(`[Bot Status] Found pending instructions for group "${chatTitle}"`);
+                        groupData.customInstructions = global.pendingGroupInstructions.get(chatTitle);
+
+                        // Remove from pending instructions once applied
+                        global.pendingGroupInstructions.delete(chatTitle);
+                      }
 
                       const savedGroup = await groupService.saveGroup(groupData);
                       console.log(`[Bot Status] Group saved successfully: ${savedGroup.id}`);
@@ -1798,6 +1920,8 @@ async function initializeAgentData() {
                     updatedAt: currentUpdatedAt,
                     name: agent.name
                   });
+                  console.log(`Bot stored in active bots map. Total active bots: ${activeBots.size}`);
+                  console.log(`Active bot tokens: ${activeTokens.size}`);
 
                   // Enable graceful stop for this specific bot
                   process.once('SIGINT', () => {
@@ -1815,311 +1939,6 @@ async function initializeAgentData() {
                   // Clean up if launch fails
                   activeTokens.delete(botToken);
                 }
-
-                // Add help command for both private and group chats
-                bot.command('help', async (ctx) => {
-                  console.log(`[Help] Command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
-
-                  // Content differs based on whether we're in a private chat or group
-                  if (ctx.chat.type === 'private') {
-                    // In private chat, show the full help menu
-                    await handleShowHelp(ctx);
-                  } else {
-                    // Check if agent has a validated API key
-                    const hasValidApiKey = agent.userId && agent.userId._id && agent.userId.apiKey && agent.userId.apiKey.length > 0;
-
-                    // In groups, show a more compact version
-                    const helpMessage =
-                      `*${agent.name} - Commands*\n\n` +
-
-                      (hasValidApiKey ? '' : `*⚠️ IMPORTANT:* The bot owner must set up an API key in private chat first.\n\n`) +
-
-                      `*Admin Commands:*\n` +
-                      `/modstatus - Check moderation settings\n` +
-                      `/modon - Enable moderation\n` +
-                      `/modoff - Disable moderation\n` +
-                      `/warnings @user - Check warnings\n` +
-                      `/clearwarnings @user - Clear warnings\n\n` +
-
-                      `*User Commands:*\n` +
-                      `/start - Open the main menu\n` +
-                      `/help - Show this help message\n\n` +
-
-                      `For more commands and info, chat with me privately: @${ctx.botInfo.username}`;
-
-                    // Send compact help message
-                    await ctx.replyWithMarkdown(helpMessage);
-                  }
-                });
-
-                bot.command('modstatus', async (ctx) => {
-                  console.log(`Moderation status command received from user: ${ctx.from.id} (${ctx.from.username || 'no username'})`);
-                  console.log(`[DEBUG-COMMAND] /modstatus command received in chat type: ${ctx.chat.type}, chat ID: ${ctx.chat.id}`);
-
-                  // Only proceed in group chats
-                  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
-                    console.log(`[DEBUG-COMMAND] /modstatus rejected - not a group chat (type: ${ctx.chat.type})`);
-                    return ctx.reply('This command is only available in groups.');
-                  }
-
-                  // Only chat administrators can use this command
-                  try {
-                    console.log(`[DEBUG-COMMAND] Checking if user ${ctx.from.id} is an admin in chat ${ctx.chat.id}`);
-                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-                    const isAdmin = ['creator', 'administrator'].includes(member.status);
-                    console.log(`[DEBUG-COMMAND] User ${ctx.from.id} admin status: ${isAdmin ? 'Is admin' : 'Not admin'} (${member.status})`);
-
-                    if (!isAdmin) {
-                      console.log(`[DEBUG-COMMAND] /modstatus rejected - user is not an admin`);
-                      return ctx.reply('Only administrators can use this command.');
-                    }
-                  } catch (error) {
-                    console.error(`[DEBUG-COMMAND] Error checking admin status for user ${ctx.from.id}:`, error);
-                    return ctx.reply('An error occurred while checking admin status.');
-                  }
-                });
-
-                // Handle modoff command
-                bot.command('modoff', async (ctx) => {
-                  console.log(`MODOFF command received from user ${ctx.from.id} in chat ${ctx.chat.id}`);
-
-                  // Only works in groups
-                  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
-                    return ctx.reply('This command can only be used in groups.');
-                  }
-
-                  // Check if user is an admin
-                  try {
-                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-                    const isAdmin = ['creator', 'administrator'].includes(member.status);
-
-                    if (!isAdmin) {
-                      return ctx.reply('⚠️ Only group administrators can use this command.');
-                    }
-
-                    // Update group settings in the database
-                    const group = await groupService.updateModerationStatus(ctx.chat.id.toString(), false);
-
-                    if (group) {
-                      ctx.reply('✅ Moderation is now disabled for this group. I will no longer analyze or moderate messages.');
-                      console.log(`[MODOFF] Moderation disabled for group ${ctx.chat.id} by user ${ctx.from.id}`);
-                    } else {
-                      ctx.reply('⚠️ An error occurred while updating moderation settings.');
-                      console.error(`[MODOFF] Error updating moderation status for group ${ctx.chat.id}`);
-                    }
-
-                  } catch (error) {
-                    console.error('Error checking admin status:', error);
-                    ctx.reply('⚠️ An error occurred while checking your admin status.');
-                  }
-                });
-
-                // Handle warnings command - check warnings for a user
-                bot.command('warnings', async (ctx) => {
-                  console.log(`WARNINGS command received from user ${ctx.from.id} in chat ${ctx.chat.id}`);
-
-                  // Only works in groups
-                  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
-                    return ctx.reply('This command can only be used in groups.');
-                  }
-
-                  // Check if user is an admin
-                  try {
-                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-                    const isAdmin = ['creator', 'administrator'].includes(member.status);
-
-                    if (!isAdmin) {
-                      return ctx.reply('⚠️ Only group administrators can use this command.');
-                    }
-
-                    // Parse the target user from the command
-                    const args = ctx.message.text.split(' ');
-
-                    if (args.length < 2) {
-                      return ctx.reply('⚠️ Please specify a user: /warnings @username or /warnings user_id');
-                    }
-
-                    let targetUser = args[1];
-                    let targetUserId;
-
-                    // Handle both username and user ID formats
-                    if (targetUser.startsWith('@')) {
-                      // Username format - need to find the user ID
-                      const username = targetUser.substring(1);
-
-                      try {
-                        // Try to get user info from message mention
-                        if (ctx.message.entities && ctx.message.entities.length > 0) {
-                          for (const entity of ctx.message.entities) {
-                            if (entity.type === 'mention' && entity.user) {
-                              targetUserId = entity.user.id.toString();
-                              break;
-                            }
-                          }
-                        }
-
-                        // If we couldn't get the ID from mention, try to get chat members
-                        if (!targetUserId) {
-                          // This is a limitation - we can only check warnings for users currently in the group
-                          const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, username);
-                          if (chatMember && chatMember.user) {
-                            targetUserId = chatMember.user.id.toString();
-                          }
-                        }
-                      } catch (error) {
-                        console.error(`Error finding user by username: ${username}`, error);
-                      }
-
-                      if (!targetUserId) {
-                        return ctx.reply(`⚠️ Could not find user ${targetUser} in this group. The user must be a current member.`);
-                      }
-                    } else {
-                      // Direct user ID format
-                      targetUserId = targetUser;
-                    }
-
-                    // Get warning info for the user
-                    const warningInfo = await warningService.getWarningInfo(targetUserId, ctx.chat.id.toString());
-
-                    if (!warningInfo || warningInfo.warningCount === 0) {
-                      return ctx.reply(`✅ User has no warnings in this group.`);
-                    }
-
-                    // Format warning information
-                    let message = `*Warning Information*\n\n`;
-                    message += `• User: ${warningInfo.username ? '@' + warningInfo.username : 'ID: ' + warningInfo.userId}\n`;
-                    message += `• Warning Count: ${warningInfo.warningCount}/${warningService.WARNING_THRESHOLDS.BAN}\n`;
-
-                    if (warningInfo.lastWarningDate) {
-                      const lastWarningDate = new Date(warningInfo.lastWarningDate);
-                      message += `• Last Warning: ${lastWarningDate.toLocaleDateString()} ${lastWarningDate.toLocaleTimeString()}\n`;
-                    }
-
-                    if (warningInfo.isBanned) {
-                      message += `• Status: 🚫 Banned\n`;
-                      if (warningInfo.banReason) {
-                        message += `• Ban Reason: ${warningInfo.banReason}\n`;
-                      }
-                      if (warningInfo.banDate) {
-                        const banDate = new Date(warningInfo.banDate);
-                        message += `• Ban Date: ${banDate.toLocaleDateString()}\n`;
-                      }
-                    } else if (warningInfo.warningCount >= warningService.WARNING_THRESHOLDS.TEMP_MUTE) {
-                      const remainingWarnings = warningService.WARNING_THRESHOLDS.BAN - warningInfo.warningCount;
-                      message += `• Status: ⚠️ At risk - ${remainingWarnings} more warning${remainingWarnings !== 1 ? 's' : ''} until ban\n`;
-                    }
-
-                    // Show recent warnings
-                    if (warningInfo.recentWarnings && warningInfo.recentWarnings.length > 0) {
-                      message += `\n*Recent Warnings:*\n`;
-                      warningInfo.recentWarnings.forEach((warning, index) => {
-                        const warningDate = new Date(warning.timestamp);
-                        message += `${index + 1}. ${warning.reason}\n`;
-                        message += `   ${warningDate.toLocaleDateString()} ${warningDate.toLocaleTimeString()}\n`;
-                      });
-                    }
-
-                    message += `\nUse /clearwarnings ${targetUser} to clear all warnings for this user.`;
-
-                    await ctx.replyWithMarkdown(message);
-                    console.log(`[WARNINGS] Displayed warnings for user ${targetUserId} in group ${ctx.chat.id}`);
-
-                  } catch (error) {
-                    console.error('Error checking warnings:', error);
-                    ctx.reply('⚠️ An error occurred while checking warnings.');
-                  }
-                });
-
-                // Handle clearwarnings command - clear warnings for a user
-                bot.command('clearwarnings', async (ctx) => {
-                  console.log(`CLEARWARNINGS command received from user ${ctx.from.id} in chat ${ctx.chat.id}`);
-
-                  // Only works in groups
-                  if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
-                    return ctx.reply('This command can only be used in groups.');
-                  }
-
-                  // Check if user is an admin
-                  try {
-                    const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-                    const isAdmin = ['creator', 'administrator'].includes(member.status);
-
-                    if (!isAdmin) {
-                      return ctx.reply('⚠️ Only group administrators can use this command.');
-                    }
-
-                    // Parse the target user from the command
-                    const args = ctx.message.text.split(' ');
-
-                    if (args.length < 2) {
-                      return ctx.reply('⚠️ Please specify a user: /clearwarnings @username or /clearwarnings user_id');
-                    }
-
-                    let targetUser = args[1];
-                    let targetUserId;
-
-                    // Handle both username and user ID formats
-                    if (targetUser.startsWith('@')) {
-                      // Username format - need to find the user ID
-                      const username = targetUser.substring(1);
-
-                      try {
-                        // Try to get user info from message mention
-                        if (ctx.message.entities && ctx.message.entities.length > 0) {
-                          for (const entity of ctx.message.entities) {
-                            if (entity.type === 'mention' && entity.user) {
-                              targetUserId = entity.user.id.toString();
-                              break;
-                            }
-                          }
-                        }
-
-                        // If we couldn't get the ID from mention, try to get chat members
-                        if (!targetUserId) {
-                          const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, username);
-                          if (chatMember && chatMember.user) {
-                            targetUserId = chatMember.user.id.toString();
-                          }
-                        }
-                      } catch (error) {
-                        console.error(`Error finding user by username: ${username}`, error);
-                      }
-
-                      if (!targetUserId) {
-                        return ctx.reply(`⚠️ Could not find user ${targetUser} in this group. The user must be a current member.`);
-                      }
-                    } else {
-                      // Direct user ID format
-                      targetUserId = targetUser;
-                    }
-
-                    // Get current warning count for confirmation
-                    const warningInfo = await warningService.getWarningInfo(targetUserId, ctx.chat.id.toString());
-
-                    if (!warningInfo || warningInfo.warningCount === 0) {
-                      return ctx.reply(`✅ User has no warnings to clear.`);
-                    }
-
-                    // Clear warnings
-                    const success = await warningService.clearWarnings(targetUserId, ctx.chat.id.toString());
-
-                    if (success) {
-                      let message = `✅ Successfully cleared all warnings for `;
-                      message += warningInfo.username ? `@${warningInfo.username}` : `user ID: ${targetUserId}`;
-                      message += ` (previously had ${warningInfo.warningCount} warning${warningInfo.warningCount !== 1 ? 's' : ''}).`;
-
-                      await ctx.reply(message);
-                      console.log(`[CLEARWARNINGS] Cleared warnings for user ${targetUserId} in group ${ctx.chat.id}`);
-                    } else {
-                      await ctx.reply('⚠️ An error occurred while clearing warnings.');
-                      console.error(`[CLEARWARNINGS] Error clearing warnings for user ${targetUserId} in group ${ctx.chat.id}`);
-                    }
-
-                  } catch (error) {
-                    console.error('Error clearing warnings:', error);
-                    ctx.reply('⚠️ An error occurred while clearing warnings.');
-                  }
-                });
               } catch (error) {
                 console.error(`Error creating bot for agent ${agent.name}:`, error);
               }

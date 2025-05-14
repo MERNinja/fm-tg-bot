@@ -115,9 +115,11 @@ class FullmetalService {
    * @param {string} userMessage - The user's message
    * @param {Object} agent - The agent object to use
    * @param {string} [apiKey] - Optional specific API key to use (for group-specific billing)
+   * @param {string} [telegramUserId] - Optional Telegram user ID for context
+   * @param {string} [telegramChatId] - Optional Telegram chat ID to check for group-specific instructions
    * @returns {Promise<{response: Response, agent: Object}>} - The streaming response from the API and agent object
    */
-  async getStreamingResponse(userMessage, agent, apiKey = null) {
+  async getStreamingResponse(userMessage, agent, apiKey = null, telegramUserId = null, telegramChatId = null) {
     // Use provided API key or fallback to agent's user API key
     const useApiKey = apiKey || (agent.userId && agent.userId.apiKey && agent.userId.apiKey.length > 0 ? agent.userId.apiKey[0] : null);
 
@@ -126,8 +128,26 @@ class FullmetalService {
       throw new Error('No API key available');
     }
 
-    // Add instruction to respond in natural language, not JSON
+    // Default to agent's system prompt
     let systemPrompt = agent.summary.system || "";
+
+    // Check for group-specific instructions if telegramChatId is provided and it's not a private chat
+    if (telegramChatId && telegramChatId !== telegramUserId) {
+      try {
+        const Group = require('../models/Group');
+        const group = await Group.findOne({ telegramGroupId: telegramChatId });
+
+        if (group && group.customInstructions && group.customInstructions.trim() !== '') {
+          // Use the group's custom instructions instead of the agent's system prompt
+          systemPrompt = group.customInstructions;
+          console.log(`[FullmetalService] Using custom instructions for Telegram group ${telegramChatId}`);
+        }
+      } catch (error) {
+        console.error(`[FullmetalService] Error fetching custom instructions for group ${telegramChatId}:`, error);
+        // Fall back to agent's system prompt (already set)
+      }
+    }
+    // Remove user-specific instructions block and just use agent's system prompt for private chats
 
     // Customize system prompt based on message type
     if (userMessage.includes("MODERATION_ANALYSIS")) {

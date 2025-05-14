@@ -36,6 +36,10 @@ const groupSchema = new Schema(
             type: Schema.Types.ObjectId,
             ref: 'user'
         },
+        customInstructions: {
+            type: String,
+            default: ''  // Empty string means use the agent's default instructions
+        },
         isActive: {
             type: Boolean,
             default: true

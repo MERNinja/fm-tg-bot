@@ -72,7 +72,7 @@ class MessageController {
         ).catch(error => console.error('[Controller] Error updating initial message:', error));
 
         // Get streaming response from Fullmetal API with timeout handling
-        const apiPromise = fullmetalService.getStreamingResponse(messageWithContext, agent);
+        const apiPromise = fullmetalService.getStreamingResponse(messageWithContext, agent, null, telegramUserId, telegramChatId);
 
         // Create a timeout promise
         const timeoutPromise = new Promise((_, reject) => {

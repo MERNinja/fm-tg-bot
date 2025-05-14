@@ -152,7 +152,7 @@ class ModerationService {
             }
 
             // Get a response from the Fullmetal agent
-            const { response } = await fullmetalService.getStreamingResponse(messageWithContext, agent, apiKey);
+            const { response } = await fullmetalService.getStreamingResponse(messageWithContext, agent, apiKey, telegramUserId, telegramGroupId);
 
             let responseData = '';
             let buffer = '';

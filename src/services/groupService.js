@@ -101,6 +101,29 @@ class GroupService {
     }
 
     /**
+     * Get all groups added by a specific user
+     * 
+     * @param {String} userId - MongoDB ID of the user who added the groups
+     * @returns {Promise<Array>} - Array of groups
+     */
+    async getGroupsByAddedByUserId(userId) {
+        try {
+            const groups = await Group.find({
+                addedByUserId: userId,
+                isActive: true
+            })
+                .sort({ lastActivity: -1 })
+                .populate('agentId', 'name');
+
+            console.log(`[GroupService] Found ${groups.length} groups added by user ${userId}`);
+            return groups;
+        } catch (error) {
+            console.error(`[GroupService] Error getting groups added by user ${userId}:`, error);
+            return [];
+        }
+    }
+
+    /**
      * Update a group's API key user
      * 
      * @param {String} telegramGroupId - Telegram group ID
@@ -148,6 +171,32 @@ class GroupService {
             return group;
         } catch (error) {
             console.error(`[GroupService] Error toggling moderation for group ${telegramGroupId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update moderation settings for a group
+     * 
+     * @param {String} telegramGroupId - Telegram group ID
+     * @param {Boolean} enabled - Whether moderation should be enabled
+     * @returns {Promise<Object>} - The updated group
+     */
+    async updateGroupModeration(telegramGroupId, enabled) {
+        try {
+            const group = await Group.findOneAndUpdate(
+                { telegramGroupId },
+                {
+                    moderationEnabled: enabled,
+                    lastActivity: new Date()
+                },
+                { new: true }
+            );
+
+            console.log(`[GroupService] ${enabled ? 'Enabled' : 'Disabled'} moderation for group ${telegramGroupId}`);
+            return group;
+        } catch (error) {
+            console.error(`[GroupService] Error updating moderation for group ${telegramGroupId}:`, error);
             throw error;
         }
     }
@@ -218,6 +267,76 @@ class GroupService {
         } catch (error) {
             console.error(`[GroupService] Error getting API key user for group ${telegramGroupId}:`, error);
             return null;
+        }
+    }
+
+    /**
+     * Get custom instructions for a group
+     * 
+     * @param {String} telegramGroupId - Telegram group ID
+     * @returns {Promise<String>} - Custom instructions text or empty string
+     */
+    async getGroupInstructions(telegramGroupId) {
+        try {
+            const group = await Group.findOne({ telegramGroupId });
+            if (!group) {
+                return '';
+            }
+            return group.customInstructions || '';
+        } catch (error) {
+            console.error(`[GroupService] Error getting instructions for group ${telegramGroupId}:`, error);
+            return '';
+        }
+    }
+
+    /**
+     * Set custom instructions for a group
+     * 
+     * @param {String} telegramGroupId - Telegram group ID
+     * @param {String} instructions - The custom instructions text
+     * @returns {Promise<Object>} - The updated group
+     */
+    async setGroupInstructions(telegramGroupId, instructions) {
+        try {
+            const group = await Group.findOneAndUpdate(
+                { telegramGroupId },
+                {
+                    customInstructions: instructions,
+                    lastActivity: new Date()
+                },
+                { new: true }
+            );
+
+            console.log(`[GroupService] Updated custom instructions for group ${telegramGroupId}`);
+            return group;
+        } catch (error) {
+            console.error(`[GroupService] Error setting instructions for group ${telegramGroupId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Clear custom instructions for a group
+     * 
+     * @param {String} telegramGroupId - Telegram group ID
+     * @returns {Promise<Object>} - The updated group
+     */
+    async clearGroupInstructions(telegramGroupId) {
+        try {
+            const group = await Group.findOneAndUpdate(
+                { telegramGroupId },
+                {
+                    customInstructions: '',
+                    lastActivity: new Date()
+                },
+                { new: true }
+            );
+
+            console.log(`[GroupService] Cleared custom instructions for group ${telegramGroupId}`);
+            return group;
+        } catch (error) {
+            console.error(`[GroupService] Error clearing instructions for group ${telegramGroupId}:`, error);
+            throw error;
         }
     }
 }
