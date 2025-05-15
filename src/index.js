@@ -2005,7 +2005,7 @@ function scheduleAgentUpdates(intervalMinutes = 1) {
   console.log('Initial setup complete');
 
   // Schedule periodic updates
-  scheduleAgentUpdates(100);
+  scheduleAgentUpdates();
   console.log('Agent update scheduler initialized');
 
   // Setup heartbeat mechanism
