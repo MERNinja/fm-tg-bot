@@ -1987,7 +1987,7 @@ async function initializeAgentData() {
 
 // Function to periodically check for new or updated agents
 function scheduleAgentUpdates(intervalMinutes = 1) {
-  const intervalMs = intervalMinutes * 1000;
+  const intervalMs = intervalMinutes * 60 * 1000;
   console.log(`Scheduling agent updates every ${intervalMinutes} minute(s)...`);
 
   // Set up interval for periodic checks
